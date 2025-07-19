@@ -1,5 +1,4 @@
 /**
- *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,6 +14,33 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * HTable 用于与单个HBase表进行通信。实现了 HTableInterface 接口。
+ * 鼓励用户通过 HConnection 和 HConnectionManager 获取实例，而不是直接构造此类的实例。
+ * 有关示例，请参见 HConnectionManager 类注释。
+ *
+ * 对于读写操作，此类不是线程安全的。
+ *
+ * 在写入（Puts）的情况下，如果多个线程争用单个HTable实例，则基础写缓冲区可能会被破坏。
+ *
+ * 在读取的情况下，Scan使用的某些字段在所有线程之间共享。
+ * HTable实现可以不保证在Get的情况下是安全的。
+ *
+ * 传递相同Configuration实例的HTable实例将共享到集群中服务器和zookeeper集合的连接以及区域位置的缓存。
+ * 这通常是一件好事，建议为所有表重用相同的配置对象。
+ * 这是因为它们都将共享相同的基础HConnection实例。有关此机制如何工作的更多信息，请参见HConnectionManager。
+ *
+ * HConnection将在初始构造时从传递的Configuration中读取其所需的大多数配置。
+ * 此后，对于诸如hbase.client.pause，hbase.client.retries.number和hbase.client.rpc.maxattempts之类的设置，
+ * 在HConnection构造后更新传递的Configuration中的值将不会被注意到。
+ * 要使用更改后的值运行，请创建一个新的HTable，并传递具有新配置的新Configuration实例。
+ *
+ * 请注意，此类实现了Closeable接口。当不再需要HTable实例时，应将其关闭，以确保及时释放基础资源。
+ * 请注意，close方法可能会引发必须处理的java.io.IOException。
+ *
+ * @see HBaseAdmin 用于创建，删除，列出，启用和禁用表。
+ * @see HConnection
+ * @see HConnectionManager
  */
 package org.apache.hadoop.hbase.client;
 
@@ -125,38 +151,56 @@ import com.google.protobuf.ServiceException;
 @InterfaceStability.Stable
 public class HTable implements HTableInterface {
   private static final Log LOG = LogFactory.getLog(HTable.class);
+  /** HBase连接 */
   protected HConnection connection;
+  /** 表名 */
   private final TableName tableName;
+  /** 配置 */
   private volatile Configuration configuration;
+  /** 表配置 */
   private TableConfiguration tableConfiguration;
+  /** 异步写缓冲区 */
   protected List<Row> writeAsyncBuffer = new LinkedList<Row>();
+  /** 写缓冲区大小 */
   private long writeBufferSize;
+  /** 失败时是否清除缓冲区 */
   private boolean clearBufferOnFail;
+  /** 是否自动刷新 */
   private boolean autoFlush;
+  /** 当前写缓冲区大小 */
   protected long currentWriteBufferSize;
+  /** 扫描器缓存 */
   protected int scannerCaching;
+  /** 扫描器最大结果大小 */
   protected long scannerMaxResultSize;
-  private ExecutorService pool;  // For Multi
+  /** 用于Multi操作的线程池 */
+  private ExecutorService pool;
+  /** 是否已关闭 */
   private boolean closed;
-  private int operationTimeout; // global timeout for each blocking method with retrying rpc
-  private int rpcTimeout; // timeout for each rpc request
-  private final boolean cleanupPoolOnClose; // shutdown the pool in close()
-  private final boolean cleanupConnectionOnClose; // close the connection in close()
+  /** 每个阻塞方法的全局超时时间（带重试rpc） */
+  private int operationTimeout;
+  /** 每个rpc请求的超时时间 */
+  private int rpcTimeout;
+  /** 关闭时是否清理线程池 */
+  private final boolean cleanupPoolOnClose;
+  /** 关闭时是否清理连接 */
+  private final boolean cleanupConnectionOnClose;
 
-  /** The Async process for puts with autoflush set to false or multiputs */
+  /** 用于autoflush设置为false的put或multiput的异步进程 */
   protected AsyncProcess<Object> ap;
+  /** RPC重试调用程序工厂 */
   private RpcRetryingCallerFactory rpcCallerFactory;
+  /** RPC控制器工厂 */
   private RpcControllerFactory rpcControllerFactory;
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>conf</code> instance.  Uses already-populated
-   * region cache if one is available, populated by any other HTable instances
-   * sharing this <code>conf</code> instance.  Recommended.
-   * @param conf Configuration object to use.
-   * @param tableName Name of the table.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>conf</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 如果有可用的已填充区域缓存，则使用该缓存，该缓存由共享此 <code>conf</code> 实例的任何其他HTable实例填充。
+   * 推荐使用。
+   * @param conf 要使用的配置对象。
+   * @param tableName 表的名称。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(Configuration conf, final String tableName)
   throws IOException {
@@ -164,14 +208,13 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>conf</code> instance.  Uses already-populated
-   * region cache if one is available, populated by any other HTable instances
-   * sharing this <code>conf</code> instance.  Recommended.
-   * @param conf Configuration object to use.
-   * @param tableName Name of the table.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>conf</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 如果有可用的已填充区域缓存，则使用该缓存，该缓存由共享此 <code>conf</code> 实例的任何其他HTable实例填充。
+   * 推荐使用。
+   * @param conf 要使用的配置对象。
+   * @param tableName 表的名称。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(Configuration conf, final byte[] tableName)
   throws IOException {
@@ -181,14 +224,13 @@ public class HTable implements HTableInterface {
 
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>conf</code> instance.  Uses already-populated
-   * region cache if one is available, populated by any other HTable instances
-   * sharing this <code>conf</code> instance.  Recommended.
-   * @param conf Configuration object to use.
-   * @param tableName table name pojo
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>conf</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 如果有可用的已填充区域缓存，则使用该缓存，该缓存由共享此 <code>conf</code> 实例的任何其他HTable实例填充。
+   * 推荐使用。
+   * @param conf 要使用的配置对象。
+   * @param tableName 表名POJO
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(Configuration conf, final TableName tableName)
   throws IOException {
@@ -206,12 +248,11 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table. Shares zookeeper connection and other resources with
-   * other HTable instances created with the same <code>connection</code> instance. Use this
-   * constructor when the HConnection instance is externally managed.
-   * @param tableName Name of the table.
-   * @param connection HConnection to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。与使用相同 <code>connection</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 当HConnection实例由外部管理时，请使用此构造函数。
+   * @param tableName 表的名称。
+   * @param connection 要使用的HConnection。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(TableName tableName, HConnection connection) throws IOException {
     this.tableName = tableName;
@@ -224,6 +265,11 @@ public class HTable implements HTableInterface {
     this.finishSetup();
   }
 
+  /**
+   * 获取默认的线程池执行器。
+   * @param conf 配置对象
+   * @return 线程池执行器
+   */
   public static ThreadPoolExecutor getDefaultExecutor(Configuration conf) {
     int maxThreads = conf.getInt("hbase.htable.threads.max", Integer.MAX_VALUE);
     if (maxThreads == 0) {
@@ -242,16 +288,14 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>conf</code> instance.  Uses already-populated
-   * region cache if one is available, populated by any other HTable instances
-   * sharing this <code>conf</code> instance.
-   * Use this constructor when the ExecutorService is externally managed.
-   * @param conf Configuration object to use.
-   * @param tableName Name of the table.
-   * @param pool ExecutorService to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>conf</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 如果有可用的已填充区域缓存，则使用该缓存，该缓存由共享此 <code>conf</code> 实例的任何其他HTable实例填充。
+   * 当ExecutorService由外部管理时，请使用此构造函数。
+   * @param conf 要使用的配置对象。
+   * @param tableName 表的名称。
+   * @param pool 要使用的ExecutorService。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(Configuration conf, final byte[] tableName, final ExecutorService pool)
       throws IOException {
@@ -259,16 +303,14 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>conf</code> instance.  Uses already-populated
-   * region cache if one is available, populated by any other HTable instances
-   * sharing this <code>conf</code> instance.
-   * Use this constructor when the ExecutorService is externally managed.
-   * @param conf Configuration object to use.
-   * @param tableName Name of the table.
-   * @param pool ExecutorService to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>conf</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 如果有可用的已填充区域缓存，则使用该缓存，该缓存由共享此 <code>conf</code> 实例的任何其他HTable实例填充。
+   * 当ExecutorService由外部管理时，请使用此构造函数。
+   * @param conf 要使用的配置对象。
+   * @param tableName 表的名称。
+   * @param pool 要使用的ExecutorService。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(Configuration conf, final TableName tableName, final ExecutorService pool)
       throws IOException {
@@ -283,15 +325,13 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>connection</code> instance.
-   * Use this constructor when the ExecutorService and HConnection instance are
-   * externally managed.
-   * @param tableName Name of the table.
-   * @param connection HConnection to be used.
-   * @param pool ExecutorService to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>connection</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 当ExecutorService和HConnection实例由外部管理时，请使用此构造函数。
+   * @param tableName 表的名称。
+   * @param connection 要使用的HConnection。
+   * @param pool 要使用的ExecutorService。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(final byte[] tableName, final HConnection connection,
       final ExecutorService pool) throws IOException {
@@ -299,15 +339,13 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>connection</code> instance.
-   * Use this constructor when the ExecutorService and HConnection instance are
-   * externally managed.
-   * @param tableName Name of the table.
-   * @param connection HConnection to be used.
-   * @param pool ExecutorService to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>connection</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 当ExecutorService和HConnection实例由外部管理时，请使用此构造函数。
+   * @param tableName 表的名称。
+   * @param connection 要使用的HConnection。
+   * @param pool 要使用的ExecutorService。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(TableName tableName, final HConnection connection,
       final ExecutorService pool) throws IOException {
@@ -315,18 +353,16 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Creates an object to access a HBase table.
-   * Shares zookeeper connection and other resources with other HTable instances
-   * created with the same <code>connection</code> instance.
-   * Use this constructor when the ExecutorService and HConnection instance are
-   * externally managed.
-   * @param tableName Name of the table.
-   * @param connection HConnection to be used.
-   * @param tableConfig table configuration
-   * @param rpcCallerFactory RPC caller factory
-   * @param rpcControllerFactory RPC controller factory
-   * @param pool ExecutorService to be used.
-   * @throws IOException if a remote or network exception occurs
+   * 创建一个对象以访问HBase表。
+   * 与使用相同 <code>connection</code> 实例创建的其他HTable实例共享zookeeper连接和其他资源。
+   * 当ExecutorService和HConnection实例由外部管理时，请使用此构造函数。
+   * @param tableName 表的名称。
+   * @param connection 要使用的HConnection。
+   * @param tableConfig 表配置
+   * @param rpcCallerFactory RPC调用者工厂
+   * @param rpcControllerFactory RPC控制器工厂
+   * @param pool 要使用的ExecutorService。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HTable(TableName tableName, final HConnection connection,
       final TableConfiguration tableConfig,
@@ -350,7 +386,7 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * For internal testing.
+   * 仅供内部测试使用。
    */
   protected HTable(){
     tableName = null;
@@ -360,14 +396,14 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * @return maxKeyValueSize from configuration.
+   * @return 从配置中获取的最大键值大小。
    */
   public static int getMaxKeyValueSize(Configuration conf) {
     return conf.getInt("hbase.client.keyvalue.maxsize", -1);
   }
 
   /**
-   * setup this HTable's parameter based on the passed configuration
+   * 根据传入的配置设置此HTable的参数
    */
   private void finishSetup() throws IOException {
     if (tableConfiguration == null) {
@@ -406,13 +442,11 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Tells whether or not a table is enabled or not. This method creates a
-   * new HBase configuration, so it might make your unit tests fail due to
-   * incorrect ZK client port.
-   * @param tableName Name of table to check.
-   * @return {@code true} if table is online.
-   * @throws IOException if a remote or network exception occurs
-	* @deprecated use {@link HBaseAdmin#isTableEnabled(byte[])}
+   * 检查表是否启用。此方法会创建一个新的HBase配置，因此可能会因不正确的ZK客户端端口而导致单元测试失败。
+   * @param tableName 要检查的表名。
+   * @return 如果表在线，则为 {@code true}。
+   * @throws IOException 如果发生远程或网络异常
+	* @deprecated 请改用 {@link HBaseAdmin#isTableEnabled(byte[])}
    */
   @Deprecated
   public static boolean isTableEnabled(String tableName) throws IOException {
@@ -506,10 +540,10 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Finds the region on which the given row is being served. Does not reload the cache.
-   * @param row Row to find.
-   * @return Location of the row.
-   * @throws IOException if a remote or network exception occurs
+   * 查找给定行所在的区域。不重新加载缓存。
+   * @param row 要查找的行。
+   * @return 行的位置。
+   * @throws IOException 如果发生远程或网络异常
    */
   public HRegionLocation getRegionLocation(final byte [] row)
   throws IOException {
@@ -542,10 +576,9 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * <em>INTERNAL</em> Used by unit tests and tools to do low-level
-   * manipulations.
-   * @return An HConnection instance.
-   * @deprecated This method will be changed from public to package protected.
+   * <em>内部使用</em> 供单元测试和工具进行底层操作。
+   * @return HConnection实例。
+   * @deprecated 此方法将从public更改为包保护级别。
    */
   // TODO(tsuna): Remove this.  Unit tests shouldn't require public helpers.
   @Deprecated
@@ -554,10 +587,10 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Gets the number of rows that a scanner will fetch at once.
+   * 获取扫描器一次将获取的行数。
    * <p>
-   * The default value comes from {@code hbase.client.scanner.caching}.
-   * @deprecated Use {@link Scan#setCaching(int)} and {@link Scan#getCaching()}
+   * 默认值来自 {@code hbase.client.scanner.caching}。
+   * @deprecated 请改用 {@link Scan#setCaching(int)} 和 {@link Scan#getCaching()}
    */
   @Deprecated
   public int getScannerCaching() {
@@ -565,8 +598,8 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Kept in 0.96 for backward compatibility
-   * @deprecated  since 0.96. This is an internal buffer that should not be read nor write.
+   * 为保持0.96版本的向后兼容性而保留
+   * @deprecated 从0.96版本开始。这是一个内部缓冲区，不应读取或写入。
    */
   @Deprecated
   public List<Row> getWriteBuffer() {
@@ -574,15 +607,12 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Sets the number of rows that a scanner will fetch at once.
+   * 设置扫描器一次将获取的行数。
    * <p>
-   * This will override the value specified by
-   * {@code hbase.client.scanner.caching}.
-   * Increasing this value will reduce the amount of work needed each time
-   * {@code next()} is called on a scanner, at the expense of memory use
-   * (since more rows will need to be maintained in memory by the scanners).
-   * @param scannerCaching the number of rows a scanner will fetch at once.
-   * @deprecated Use {@link Scan#setCaching(int)}
+   * 这将覆盖由 {@code hbase.client.scanner.caching} 指定的值。
+   * 增加此值将减少每次在扫描器上调用 {@code next()} 时所需的工作量，但会增加内存使用量（因为扫描器需要在内存中维护更多行）。
+   * @param scannerCaching 扫描器一次将获取的行数。
+   * @deprecated 请改用 {@link Scan#setCaching(int)}
    */
   @Deprecated
   public void setScannerCaching(int scannerCaching) {
@@ -603,34 +633,33 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Gets the starting row key for every region in the currently open table.
+   * 获取当前打开表中每个区域的起始行键。
    * <p>
-   * This is mainly useful for the MapReduce integration.
-   * @return Array of region starting row keys
-   * @throws IOException if a remote or network exception occurs
+   * 这主要用于MapReduce集成。
+   * @return 区域起始行键的数组
+   * @throws IOException 如果发生远程或网络异常
    */
   public byte [][] getStartKeys() throws IOException {
     return getStartEndKeys().getFirst();
   }
 
   /**
-   * Gets the ending row key for every region in the currently open table.
+   * 获取当前打开表中每个区域的结束行键。
    * <p>
-   * This is mainly useful for the MapReduce integration.
-   * @return Array of region ending row keys
-   * @throws IOException if a remote or network exception occurs
+   * 这主要用于MapReduce集成。
+   * @return 区域结束行键的数组
+   * @throws IOException 如果发生远程或网络异常
    */
   public byte[][] getEndKeys() throws IOException {
     return getStartEndKeys().getSecond();
   }
 
   /**
-   * Gets the starting and ending row keys for every region in the currently
-   * open table.
+   * 获取当前打开表中每个区域的起始和结束行键。
    * <p>
-   * This is mainly useful for the MapReduce integration.
-   * @return Pair of arrays of region starting and ending row keys
-   * @throws IOException if a remote or network exception occurs
+   * 这主要用于MapReduce集成。
+   * @return 包含区域起始和结束行键数组的Pair对象
+   * @throws IOException 如果发生远程或网络异常
    */
   public Pair<byte[][],byte[][]> getStartEndKeys() throws IOException {
     NavigableMap<HRegionInfo, ServerName> regions = getRegionLocations();
@@ -648,11 +677,11 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Gets all the regions and their address for this table.
+   * 获取此表的所有区域及其地址。
    * <p>
-   * This is mainly useful for the MapReduce integration.
-   * @return A map of HRegionInfo with it's server address
-   * @throws IOException if a remote or network exception occurs
+   * 这主要用于MapReduce集成。
+   * @return HRegionInfo与其服务器地址的映射
+   * @throws IOException 如果发生远程或网络异常
    */
   public NavigableMap<HRegionInfo, ServerName> getRegionLocations() throws IOException {
     // TODO: Odd that this returns a Map of HRI to SN whereas getRegionLocation, singular, returns an HRegionLocation.
@@ -660,13 +689,12 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Get the corresponding regions for an arbitrary range of keys.
+   * 获取任意键范围对应的区域。
    * <p>
-   * @param startKey Starting row in range, inclusive
-   * @param endKey Ending row in range, exclusive
-   * @return A list of HRegionLocations corresponding to the regions that
-   * contain the specified range
-   * @throws IOException if a remote or network exception occurs
+   * @param startKey 范围内的起始行，包含
+   * @param endKey 范围内的结束行，不包含
+   * @return 与包含指定范围的区域相对应的HRegionLocation列表
+   * @throws IOException 如果发生远程或网络异常
    */
   public List<HRegionLocation> getRegionsInRange(final byte [] startKey,
     final byte [] endKey) throws IOException {
@@ -674,14 +702,13 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Get the corresponding regions for an arbitrary range of keys.
+   * 获取任意键范围对应的区域。
    * <p>
-   * @param startKey Starting row in range, inclusive
-   * @param endKey Ending row in range, exclusive
-   * @param reload true to reload information or false to use cached information
-   * @return A list of HRegionLocations corresponding to the regions that
-   * contain the specified range
-   * @throws IOException if a remote or network exception occurs
+   * @param startKey 范围内的起始行，包含
+   * @param endKey 范围内的结束行，不包含
+   * @param reload true为重新加载信息，false为使用缓存信息
+   * @return 与包含指定范围的区域相对应的HRegionLocation列表
+   * @throws IOException 如果发生远程或网络异常
    */
   public List<HRegionLocation> getRegionsInRange(final byte [] startKey,
       final byte [] endKey, final boolean reload) throws IOException {
@@ -689,15 +716,13 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Get the corresponding start keys and regions for an arbitrary range of
-   * keys.
+   * 获取任意键范围对应的起始键和区域。
    * <p>
-   * @param startKey Starting row in range, inclusive
-   * @param endKey Ending row in range
-   * @param includeEndKey true if endRow is inclusive, false if exclusive
-   * @return A pair of list of start keys and list of HRegionLocations that
-   *         contain the specified range
-   * @throws IOException if a remote or network exception occurs
+   * @param startKey 范围内的起始行，包含
+   * @param endKey 范围内的结束行
+   * @param includeEndKey 如果为true，则endRow为包含，否则为不包含
+   * @return 包含指定范围的起始键列表和HRegionLocation列表的Pair对象
+   * @throws IOException 如果发生远程或网络异常
    */
   private Pair<List<byte[]>, List<HRegionLocation>> getKeysAndRegionsInRange(
       final byte[] startKey, final byte[] endKey, final boolean includeEndKey)
@@ -706,16 +731,14 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Get the corresponding start keys and regions for an arbitrary range of
-   * keys.
+   * 获取任意键范围对应的起始键和区域。
    * <p>
-   * @param startKey Starting row in range, inclusive
-   * @param endKey Ending row in range
-   * @param includeEndKey true if endRow is inclusive, false if exclusive
-   * @param reload true to reload information or false to use cached information
-   * @return A pair of list of start keys and list of HRegionLocations that
-   *         contain the specified range
-   * @throws IOException if a remote or network exception occurs
+   * @param startKey 范围内的起始行，包含
+   * @param endKey 范围内的结束行
+   * @param includeEndKey 如果为true，则endRow为包含，否则为不包含
+   * @param reload true为重新加载信息，false为使用缓存信息
+   * @return 包含指定范围的起始键列表和HRegionLocation列表的Pair对象
+   * @throws IOException 如果发生远程或网络异常
    */
   private Pair<List<byte[]>, List<HRegionLocation>> getKeysAndRegionsInRange(
       final byte[] startKey, final byte[] endKey, final boolean includeEndKey,
@@ -759,8 +782,8 @@ public class HTable implements HTableInterface {
    }
 
    /**
-    * {@inheritDoc}
-    */
+   * {@inheritDoc}
+   */
   @Override
   public ResultScanner getScanner(final Scan scan) throws IOException {
     if (scan.getBatch() > 0 && scan.isSmall()) {
@@ -872,15 +895,14 @@ public class HTable implements HTableInterface {
    * {@inheritDoc}
    */
   @Override
-  public void batch(final List<?extends Row> actions, final Object[] results)
+  public void batch(final List<? extends Row> actions, final Object[] results)
       throws InterruptedException, IOException {
     batchCallback(actions, results, null);
   }
 
   /**
    * {@inheritDoc}
-   * @deprecated If any exception is thrown by one of the actions, there is no way to
-   * retrieve the partially executed results. Use {@link #batch(List, Object[])} instead.
+   * @deprecated 如果任何一个操作抛出异常，将无法检索部分执行的结果。请改用 {@link #batch(List, Object[])}。
    */
   @Override
   public Object[] batch(final List<? extends Row> actions)
@@ -900,10 +922,8 @@ public class HTable implements HTableInterface {
 
   /**
    * {@inheritDoc}
-   * @deprecated If any exception is thrown by one of the actions, there is no way to
-   * retrieve the partially executed results. Use
-   * {@link #batchCallback(List, Object[], org.apache.hadoop.hbase.client.coprocessor.Batch.Callback)}
-   * instead.
+   * @deprecated 如果任何一个操作抛出异常，将无法检索部分执行的结果。请改用
+   * {@link #batchCallback(List, Object[], org.apache.hadoop.hbase.client.coprocessor.Batch.Callback)}。
    */
   @Override
   public <R> Object[] batchCallback(
@@ -991,10 +1011,9 @@ public class HTable implements HTableInterface {
 
 
   /**
-   * Add the put to the buffer. If the buffer is already too large, sends the buffer to the
-   *  cluster.
-   * @throws RetriesExhaustedWithDetailsException if there is an error on the cluster.
-   * @throws InterruptedIOException if we were interrupted.
+   * 将put操作添加到缓冲区。如果缓冲区太大，则将缓冲区发送到集群。
+   * @throws RetriesExhaustedWithDetailsException 如果集群出现错误。
+   * @throws InterruptedIOException 如果我们被中断。
    */
   private void doPut(Put put) throws InterruptedIOException, RetriesExhaustedWithDetailsException {
     if (ap.hasError()){
@@ -1014,11 +1033,9 @@ public class HTable implements HTableInterface {
 
 
   /**
-   * Send the operations in the buffer to the servers. Does not wait for the server's answer.
-   * If the is an error (max retried reach from a previous flush or bad operation), it tries to
-   * send all operations in the buffer and sends an exception.
-   * @param synchronous - if true, sends all the writes and wait for all of them to finish before
-   *                     returning.
+   * 将缓冲区中的操作发送到服务器。不等待服务器的应答。
+   * 如果出现错误（例如，从先前的刷新或错误操作达到最大重试次数），它会尝试发送缓冲区中的所有操作并发送异常。
+   * @param synchronous - 如果为true，则发送所有写入并等待所有写入完成后再返回。
    */
   private void backgroundFlushCommits(boolean synchronous) throws
       InterruptedIOException, RetriesExhaustedWithDetailsException {
@@ -1183,7 +1200,7 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * @deprecated Use {@link #incrementColumnValue(byte[], byte[], byte[], long, Durability)}
+   * @deprecated 请改用 {@link #incrementColumnValue(byte[], byte[], byte[], long, Durability)}
    */
   @Deprecated
   @Override
@@ -1424,6 +1441,16 @@ public class HTable implements HTableInterface {
    * @throws IOException if there are problems talking to META. Per-item
    * exceptions are stored in the results array.
    */
+  /**
+   * 处理包含 Get、Put 和 Delete 操作的混合批量请求。同一 RegionServer 的所有操作会通过一次 RPC 调用提交。
+   * 查询会并行执行。
+   *
+   * @param list 操作列表
+   * @param results 一个与 list 大小相同的空数组。如果抛出异常，可以检查此数组以获取部分成功的结果，并确定哪些操作已成功处理。
+   * @param callback 回调函数，用于处理每行的结果
+   * @throws IOException 如果与 META 表通信时发生错误。每个操作的异常会存储在 results 数组中。
+   * @throws InterruptedException 如果线程被中断
+   */
   public <R> void processBatchCallback(
     final List<? extends Row> list, final Object[] results, final Batch.Callback<R> callback)
     throws IOException, InterruptedException {
@@ -1432,8 +1459,12 @@ public class HTable implements HTableInterface {
 
 
   /**
-   * Parameterized batch processing, allowing varying return types for different
-   * {@link Row} implementations.
+   * 参数化的批量处理，允许不同的 {@link Row} 实现返回不同的类型。
+   *
+   * @param list 操作列表
+   * @param results 一个与 list 大小相同的空数组，用于存放结果
+   * @throws IOException 如果发生 I/O 错误
+   * @throws InterruptedException 如果线程被中断
    */
   public void processBatch(final List<? extends Row> list, final Object[] results)
     throws IOException, InterruptedException {
@@ -1442,6 +1473,9 @@ public class HTable implements HTableInterface {
   }
 
 
+  /**
+   * {@inheritDoc}
+   */
   @Override
   public void close() throws IOException {
     if (this.closed) {
@@ -1459,12 +1493,12 @@ public class HTable implements HTableInterface {
     this.closed = true;
   }
 
-  // validate for well-formedness
+  // 验证 put 操作的格式是否正确
   public void validatePut(final Put put) throws IllegalArgumentException {
     validatePut(put, tableConfiguration.getMaxKeyValueSize());
   }
 
-  // validate for well-formedness
+  // 验证 put 操作的格式是否正确
   public static void validatePut(Put put, int maxKeyValueSize) throws IllegalArgumentException {
     if (put.isEmpty()) {
       throw new IllegalArgumentException("No columns to insert");
@@ -1492,6 +1526,7 @@ public class HTable implements HTableInterface {
 
   /**
    * {@inheritDoc}
+   * @deprecated 从 0.96 版本开始，此方法已不推荐使用，请改用 {@link #setAutoFlushTo(boolean)} 或 {@link #setAutoFlush(boolean, boolean)}
    */
   @Deprecated
   @Override
@@ -1517,11 +1552,10 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Returns the maximum size in bytes of the write buffer for this HTable.
+   * 返回此 HTable 写缓冲区的最大大小（字节）。
    * <p>
-   * The default value comes from the configuration parameter
-   * {@code hbase.client.write.buffer}.
-   * @return The size of the write buffer in bytes.
+   * 默认值来自配置参数 {@code hbase.client.write.buffer}。
+   * @return 写缓冲区的大小（字节）。
    */
   @Override
   public long getWriteBufferSize() {
@@ -1529,12 +1563,11 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Sets the size of the buffer in bytes.
+   * 设置缓冲区的大小（字节）。
    * <p>
-   * If the new size is less than the current amount of data in the
-   * write buffer, the buffer gets flushed.
-   * @param writeBufferSize The new write buffer size, in bytes.
-   * @throws IOException if a remote or network exception occurs.
+   * 如果新设置的大小小于写缓冲区中当前的数据量，缓冲区将被刷新。
+   * @param writeBufferSize 新的写缓冲区大小（字节）。
+   * @throws IOException 如果发生远程或网络异常。
    */
   public void setWriteBufferSize(long writeBufferSize) throws IOException {
     this.writeBufferSize = writeBufferSize;
@@ -1544,20 +1577,18 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * The pool is used for mutli requests for this HTable
-   * @return the pool used for mutli
+   * 获取用于此 HTable 的多请求线程池。
+   * @return 用于多请求的线程池
    */
   ExecutorService getPool() {
     return this.pool;
   }
 
   /**
-   * Enable or disable region cache prefetch for the table. It will be
-   * applied for the given table's all HTable instances who share the same
-   * connection. By default, the cache prefetch is enabled.
-   * @param tableName name of table to configure.
-   * @param enable Set to true to enable region cache prefetch. Or set to
-   * false to disable it.
+   * 启用或禁用表的区域缓存预取。此设置将应用于共享同一连接的所有 HTable 实例。
+   * 默认情况下，缓存预取是启用的。
+   * @param tableName 要配置的表名。
+   * @param enable 设置为 true 以启用区域缓存预取，或设置为 false 以禁用它。
    * @throws IOException
    */
   public static void setRegionCachePrefetch(final byte[] tableName,
@@ -1578,13 +1609,11 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Enable or disable region cache prefetch for the table. It will be
-   * applied for the given table's all HTable instances who share the same
-   * connection. By default, the cache prefetch is enabled.
-   * @param conf The Configuration object to use.
-   * @param tableName name of table to configure.
-   * @param enable Set to true to enable region cache prefetch. Or set to
-   * false to disable it.
+   * 启用或禁用表的区域缓存预取。此设置将应用于共享同一连接的所有 HTable 实例。
+   * 默认情况下，缓存预取是启用的。
+   * @param conf 要使用的 Configuration 对象。
+   * @param tableName 要配置的表名。
+   * @param enable 设置为 true 以启用区域缓存预取，或设置为 false 以禁用它。
    * @throws IOException
    */
   public static void setRegionCachePrefetch(final Configuration conf,
@@ -1605,11 +1634,10 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Check whether region cache prefetch is enabled or not for the table.
-   * @param conf The Configuration object to use.
-   * @param tableName name of table to check
-   * @return true if table's region cache prefecth is enabled. Otherwise
-   * it is disabled.
+   * 检查表的区域缓存预取是否已启用。
+   * @param conf 要使用的 Configuration 对象。
+   * @param tableName 要检查的表名。
+   * @return 如果表的区域缓存预取已启用，则返回 true；否则返回 false。
    * @throws IOException
    */
   public static boolean getRegionCachePrefetch(final Configuration conf,
@@ -1628,10 +1656,9 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Check whether region cache prefetch is enabled or not for the table.
-   * @param tableName name of table to check
-   * @return true if table's region cache prefecth is enabled. Otherwise
-   * it is disabled.
+   * 检查表的区域缓存预取是否已启用。
+   * @param tableName 要检查的表名。
+   * @return 如果表的区域缓存预取已启用，则返回 true；否则返回 false。
    * @throws IOException
    */
   public static boolean getRegionCachePrefetch(final byte[] tableName) throws IOException {
@@ -1650,8 +1677,8 @@ public class HTable implements HTableInterface {
   }
 
   /**
-   * Explicitly clears the region cache to fetch the latest value from META.
-   * This is a power user function: avoid unless you know the ramifications.
+   * 显式清除区域缓存，以从 META 表中获取最新值。
+   * 这是一个高级用户功能：除非您了解其后果，否则请避免使用。
    */
   public void clearRegionCache() {
     this.connection.clearRegionCache();
@@ -1741,22 +1768,33 @@ public class HTable implements HTableInterface {
     return getKeysAndRegionsInRange(start, end, true).getFirst();
   }
 
+  /**
+   * 设置操作超时时间。
+   * @param operationTimeout 操作超时时间（毫秒）
+   */
   public void setOperationTimeout(int operationTimeout) {
     this.operationTimeout = operationTimeout;
   }
 
+  /**
+   * 获取操作超时时间。
+   * @return 操作超时时间（毫秒）
+   */
   public int getOperationTimeout() {
     return operationTimeout;
   }
 
+  /**
+   * {@inheritDoc}
+   */
   @Override
   public String toString() {
     return tableName + ";" + connection;
   }
 
   /**
-   * Run basic test.
-   * @param args Pass table name and row and will get the content.
+   * 运行基本测试。
+   * @param args 传入表名和行键，将获取其内容。
    * @throws IOException
    */
   public static void main(String[] args) throws IOException {
