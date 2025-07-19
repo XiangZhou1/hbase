@@ -129,6 +129,7 @@ public class HStore implements Store {
 
   static final Log LOG = LogFactory.getLog(HStore.class);
 
+  // 内存中的写缓存区。HStore 在构造时会根据配置决定实例化 DefaultMemStore 还是 CompactingMemStore。
   protected final MemStore memstore;
   // This stores directory in the filesystem.
   private final HRegion region;
@@ -155,6 +156,7 @@ public class HStore implements Store {
   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
   private final boolean verifyBulkLoads;
 
+  // 缓存了与扫描相关的列族配置，如 TTL（Time-To-Live）、maxVersions 等，用于在扫描时进行数据过滤。
   private ScanInfo scanInfo;
 
   // TODO: ideally, this should be part of storeFileManager, as we keep passing this to it.

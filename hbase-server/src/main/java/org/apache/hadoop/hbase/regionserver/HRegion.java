@@ -295,8 +295,9 @@ public class HRegion implements HeapSize { // , Writable{
   final AtomicLong compactionNumFilesCompacted = new AtomicLong(0L);
   final AtomicLong compactionNumBytesCompacted = new AtomicLong(0L);
 
-
+  // 预写日志的引用。HRegion 自身不拥有 WAL，而是共享 HRegionServer 级别的 WAL 实例。所有写操作都必须先经过 WAL。
   private final HLog log;
+  // 封装了所有与 HDFS 交互的操作，如创建 Region 目录、管理 HFile 路径、清理临时文件等。
   private final HRegionFileSystem fs;
   protected final Configuration conf;
   private final Configuration baseConf;
@@ -567,12 +568,15 @@ public class HRegion implements HeapSize { // , Writable{
   private boolean splitRequest;
   private byte[] explicitSplitPoint = null;
 
+  // 多版本并发控制器。HBase 通过它来管理读写事务的版本号（Sequence ID），实现快照隔离。
+  // 每个读写操作开始时都会与 mvcc 交互以获取“读点”或“写点”。
   private final MultiVersionConsistencyControl mvcc =
       new MultiVersionConsistencyControl();
 
   // Coprocessor host
   private RegionCoprocessorHost coprocessorHost;
 
+  // 该 Region 所属表的 schema 定义，包含了列族、副本数、是否只读等重要信息。
   private HTableDescriptor htableDescriptor = null;
   private RegionSplitPolicy splitPolicy;
 
@@ -782,6 +786,7 @@ public class HRegion implements HeapSize { // , Writable{
 
   private long initializeRegionInternals(final CancelableProgressable reporter,
       final MonitoredTask status) throws IOException, UnsupportedEncodingException {
+    // 1. 调用协处理器 pre-open hook
     if (coprocessorHost != null) {
       status.setStatus("Running coprocessor pre-open hook");
       coprocessorHost.preOpen();
@@ -789,6 +794,7 @@ public class HRegion implements HeapSize { // , Writable{
 
     // Write HRI to a file in case we need to recover hbase:meta
     status.setStatus("Writing region info on filesystem");
+    // 2. 将 .regioninfo 文件写入 HDFS，用于元数据恢复
     fs.checkRegionInfoOnFilesystem();
 
     // Remove temporary data left over from old regions
@@ -796,7 +802,11 @@ public class HRegion implements HeapSize { // , Writable{
     fs.cleanupTempDir();
 
     // Initialize all the HStores
+    // 3. 初始化所有的 HStore
+    //    - 这个过程会并行地打开每个列族目录下的 HFile
+    //    - 它会返回所有 HFile 中找到的最大 Sequence ID
     status.setStatus("Initializing all the Stores");
+    // 4. 将 MVCC 的起始点推进到找到的最大 Sequence ID
     long maxSeqId = initializeRegionStores(reporter, status);
 
     status.setStatus("Cleaning up detritus from prior splits");
@@ -811,6 +821,7 @@ public class HRegion implements HeapSize { // , Writable{
     this.writestate.compacting = 0;
 
     // Initialize split policy
+    // 6. 初始化 Split 和 Flush 策略
     this.splitPolicy = RegionSplitPolicy.create(this, conf);
 
     this.lastFlushTime = EnvironmentEdgeManager.currentTimeMillis();
@@ -2392,6 +2403,7 @@ public class HRegion implements HeapSize { // , Writable{
   OperationStatus[] batchMutate(BatchOperationInProgress<?> batchOp) throws IOException {
     boolean initialized = false;
     Operation op = batchOp.isInReplay() ? Operation.REPLAY_BATCH_MUTATE : Operation.BATCH_MUTATE;
+    // 1. 启动 Region 操作，获取读锁
     startRegionOperation(op);
     try {
       while (!batchOp.isDone()) {
@@ -2402,11 +2414,13 @@ public class HRegion implements HeapSize { // , Writable{
 
         if (!initialized) {
           this.writeRequestsCount.add(batchOp.operations.length);
+          // 2. 准备操作，包括运行协处理器 pre-hooks
           if (!batchOp.isInReplay()) {
             doPreMutationHook(batchOp);
           }
           initialized = true;
         }
+        // 3. 执行一个“微批次”
         doMiniBatchMutation(batchOp);
         long newSize = this.getMemstoreSize().get();
         if (isFlushSize(newSize)) {
