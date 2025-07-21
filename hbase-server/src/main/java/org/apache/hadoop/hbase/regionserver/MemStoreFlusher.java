@@ -230,11 +230,15 @@ class MemStoreFlusher implements FlushRequester {
         FlushQueueEntry fqe = null;
         try {
           wakeupPending.set(false); // allow someone to wake us up again
+          // 从 DelayQueue 中阻塞式地获取一个 flush 请求，可以设置超时
           fqe = flushQueue.poll(threadWakeFrequency, TimeUnit.MILLISECONDS);
+
+          // 如果队列为空，或者取到的是一个唤醒标记（用于处理全局内存压力）
           if (fqe == null || fqe instanceof WakeupFlushThread) {
             if (isAboveLowWaterMark()) {
               LOG.debug("Flush thread woke up because memory above low water="
                   + StringUtils.humanReadableInt(globalMemStoreLimitLowMark));
+              // 如果全局内存使用超过了低水位线，强制 flush 内存最大的 Region
               if (!flushOneForGlobalPressure()) {
                 // Wasn't able to flush any region, but we're above low water mark
                 // This is unlikely to happen, but might happen when closing the
@@ -249,7 +253,10 @@ class MemStoreFlusher implements FlushRequester {
             }
             continue;
           }
+
+          // 如果取到的是一个普通的 Region flush 请求
           FlushRegionEntry fre = (FlushRegionEntry) fqe;
+          // 调用 flushRegion 处理，包含了 HFile 数量检查和延迟逻辑
           if (!flushRegion(fre)) {
             break;
           }
@@ -322,12 +329,15 @@ class MemStoreFlusher implements FlushRequester {
   }
 
   public void requestFlush(HRegion r) {
+    // 同步 regionsInQueue，这是一个 Map，防止同一个 Region 被重复入队
     synchronized (regionsInQueue) {
       if (!regionsInQueue.containsKey(r)) {
         // This entry has no delay so it will be added at the top of the flush
         // queue.  It'll come out near immediately.
+        // 创建一个 FlushRegionEntry，它没有延迟，会立刻被处理
         FlushRegionEntry fqe = new FlushRegionEntry(r);
         this.regionsInQueue.put(r, fqe);
+        // 将 Entry 添加到 flushQueue (一个 DelayQueue)
         this.flushQueue.add(fqe);
       }
     }
@@ -397,9 +407,18 @@ class MemStoreFlusher implements FlushRequester {
    * @return true if the region was successfully flushed, false otherwise. If
    * false, there will be accompanying log messages explaining why the region was
    * not flushed.
+   *
+   * ● 检查 HFile 数量 (isTooManyStoreFiles):
+        ○ HBase 不希望一个 Store（列族）下有太多的 HFile，因为这会严重影响读性能（需要更多的 seek）。这个上限由 hbase.hstore.blockingStoreFiles 配置。
+        ○ 如果 HFile 数量超限：
+          ■ 首次超限: 打印一条 WARN 日志，并主动为该 Region 请求一次 Compaction (requestSystemCompaction)，希望能合并文件。
+          ■ 延迟请求: 将 FlushRegionEntry 重新放入 flushQueue，并设置一个较短的延迟时间。这给了 Compaction 执行的时间窗口。
+          ■ 超时强制执行: 如果一个 flush 请求因为 HFile 数量过多被延迟了太久（超过 hbase.hregion.flusher.stuck.block.time.millis），则不再等待，强制执行 flush。
+      ● 条件通过: 如果 HFile 数量未超限，或已超时，则调用 flushRegion(region, false) 执行真正的 flush。
    */
   private boolean flushRegion(final FlushRegionEntry fqe) {
     HRegion region = fqe.region;
+    //  // 检查 HFile 数量是否过多 (由 hbase.hstore.blockingStoreFiles 定义)
     if (!region.getRegionInfo().isMetaRegion() &&
         isTooManyStoreFiles(region)) {
       if (fqe.isMaximumWait(this.blockingWaitTime)) {
@@ -446,6 +465,12 @@ class MemStoreFlusher implements FlushRequester {
    * @return true if the region was successfully flushed, false otherwise. If
    * false, there will be accompanying log messages explaining why the region was
    * not flushed.
+   *
+   *  ● 从 regionsInQueue 中移除该 Region 的 Entry。
+      ● 获取 Region 级别的读锁 (lock.readLock().lock())。这允许多个 flush 操作（以及读操作）并发进行，但会阻塞 Compaction、Split 等需要写锁的结构性变更。
+      ● 核心调用: 调用 region.flushcache()。
+      ● 后续操作: flush 成功后，检查是否需要触发 Compaction 或 Split，并向 CompactSplitThread 发送请求。
+      ● 在 finally 块中释放读锁。
    */
   private boolean flushRegion(final HRegion region, final boolean emergencyFlush) {
     long startTime = 0;
@@ -467,9 +492,13 @@ class MemStoreFlusher implements FlushRequester {
       // block
       startTime = EnvironmentEdgeManager.currentTimeMillis();
     }
+
+    // 获取 Region 的读锁，允许并发读和 flush，但会阻塞 Compaction 等操作
     lock.readLock().lock();
     try {
+      // 核心调用：将实际的 flush 工作委托给 HRegion 对象
       HRegion.FlushResult flushResult = region.flushcache();
+      // flush 成功后，检查是否需要触发 compaction 或 split
       boolean shouldCompact = flushResult.isCompactionNeeded();
       // We just want to check the size
       boolean shouldSplit = region.checkSplit() != null;

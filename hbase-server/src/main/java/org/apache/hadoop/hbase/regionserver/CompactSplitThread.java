@@ -318,6 +318,13 @@ public class CompactSplitThread implements CompactionRequestor {
    * @param priority override the default priority (NO_PRIORITY == decide)
    * @param request custom compaction request. Can be <tt>null</tt> in which case a simple
    *          compaction will be used.
+   *
+   *   ○ 检查：确认 RegionServer 是否正在运行，以及表的 Compaction 功能是否被禁用。
+   *   ○ 文件选择 (selectNow)：
+   *     ■ 对于系统自动触发的 Compaction，selectNow 为 false。请求只是一个“意图”，会被放入队列，具体的 HFile 选择会推迟到 CompactionRunner 真正执行时才进行。
+   *     ■ 对于用户手动触发的 Compaction，selectNow 为 true。会立即调用 selectCompaction 来确定要合并哪些文件。
+   *   ○ 选择线程池: 根据预计的 Compaction 大小，选择是放入 smallCompactions 还是 largeCompactions 线程池。这是一个简单的负载均衡策略。
+   *   ○ 提交任务: 创建一个 CompactionRunner（一个 Runnable 任务）并提交到选定的线程池中异步执行。
    */
   private synchronized CompactionRequest requestCompactionInternal(final HRegion r, final Store s,
       final String why, int priority, CompactionRequest request, boolean selectNow, User user)
@@ -327,6 +334,11 @@ public class CompactSplitThread implements CompactionRequestor {
       return null;
     }
 
+    /**
+     *   ○ 文件选择 (selectNow)：
+     *     ■ 对于系统自动触发的 Compaction，selectNow 为 false。请求只是一个“意图”，会被放入队列，具体的 HFile 选择会推迟到 CompactionRunner 真正执行时才进行。
+     *     ■ 对于用户手动触发的 Compaction，selectNow 为 true。会立即调用 selectCompaction 来确定要合并哪些文件。
+     */
     CompactionContext compaction = null;
     if (selectNow) {
       compaction = selectCompaction(r, s, priority, request, user);
@@ -335,8 +347,11 @@ public class CompactSplitThread implements CompactionRequestor {
 
     // We assume that most compactions are small. So, put system compactions into small
     // pool; we will do selection there, and move to large pool if necessary.
+    // 根据 compaction 的预计大小，选择合适的线程池
+    // 大的 compaction 放入 largeCompactions 池，小的放入 smallCompactions 池
     ThreadPoolExecutor pool = (selectNow && s.throttleCompaction(compaction.getRequest().getSize()))
       ? largeCompactions : smallCompactions;
+    // 提交任务: 创建一个 CompactionRunner（一个 Runnable 任务）并提交到选定的线程池中异步执行
     pool.execute(new CompactionRunner(s, r, compaction, pool, user));
     if (LOG.isDebugEnabled()) {
       String type = (pool == smallCompactions) ? "Small " : "Large ";
@@ -461,6 +476,7 @@ public class CompactSplitThread implements CompactionRequestor {
 
     private void doCompaction(User user) {
       // Common case - system compaction without a file selection. Select now.
+      // Case 1: 延迟文件选择 (系统自动触发)
       if (this.compaction == null) {
         int oldPriority = this.queuedPriority;
         this.queuedPriority = this.store.getCompactPriority();
@@ -471,6 +487,7 @@ public class CompactSplitThread implements CompactionRequestor {
           return;
         }
         try {
+          // 在真正执行前，才调用 selectCompaction 来选择文件
           this.compaction = selectCompaction(this.region, this.store, queuedPriority, null, user);
         } catch (IOException ex) {
           LOG.error("Compaction selection failed " + this, ex);
@@ -499,6 +516,7 @@ public class CompactSplitThread implements CompactionRequestor {
         // Note: please don't put single-compaction logic here;
         //       put it into region/store/etc. This is CST logic.
         long start = EnvironmentEdgeManager.currentTimeMillis();
+        // 核心调用：将任务委托给 HRegion 的 compact 方法
         boolean completed = region.compact(compaction, store, compactionThroughputController, user);
         long now = EnvironmentEdgeManager.currentTimeMillis();
         LOG.info(((completed) ? "Completed" : "Aborted") + " compaction: " +

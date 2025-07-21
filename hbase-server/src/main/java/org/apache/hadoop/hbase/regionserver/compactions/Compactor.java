@@ -251,6 +251,7 @@ public abstract class Compactor<T extends CellSink> {
       for (StoreFile f : request.getFiles()) {
         readersToClose.add(f.cloneForReader());
       }
+      // 1. 创建所有输入 HFile 的 StoreFileScanner
       scanners = createFileScanners(readersToClose, smallestReadPoint,
         store.throttleCompaction(request.getSize()));
     } else {
@@ -265,6 +266,7 @@ public abstract class Compactor<T extends CellSink> {
       ScanType scanType = scannerFactory.getScanType(request);
       scanner = preCreateCoprocScanner(request, scanType, fd.earliestPutTs, scanners);
       if (scanner == null) {
+        // 2. 创建一个合并扫描器 (InternalScanner)，它使用 KeyValueHeap 来合并所有输入 scanner
         scanner = scannerFactory.createScanner(scanners, scanType, fd, smallestReadPoint);
       }
       scanner = postCreateCoprocScanner(request, scanType, scanner, user);
@@ -272,7 +274,9 @@ public abstract class Compactor<T extends CellSink> {
         // NULL scanner returned from coprocessor hooks means skip normal processing.
         return new ArrayList<Path>();
       }
+      // 3. 创建一个 StoreFile.Writer，用于写入新的 HFile（在临时目录）
       writer = sinkFactory.createWriter(scanner, fd, store.throttleCompaction(request.getSize()));
+      // 4. 执行数据泵送
       finished =
           performCompaction(scanner, writer, smallestReadPoint, throughputController);
       if (!finished) {
@@ -294,6 +298,7 @@ public abstract class Compactor<T extends CellSink> {
     }
     assert finished : "We should have exited the method on all error paths";
     assert writer != null : "Writer should be non-null if no error";
+    // 5. 提交 writer，完成新 HFile 的写入
     return commitWriter(writer, fd, request);
   }
 
@@ -414,17 +419,21 @@ public abstract class Compactor<T extends CellSink> {
     boolean hasMore;
     throughputController.start(compactionName);
     try {
+      // 使用 do-while 循环，因为 scanner.next() 即使返回 false 也可能带出最后一批数据
       do {
+        // 从合并扫描器中批量读取 KeyValue (Cell)
         hasMore = scanner.next(kvs, compactionKVMax);
         if (LOG.isDebugEnabled()) {
           now = EnvironmentEdgeManager.currentTimeMillis();
         }
+        // 遍历读取到的 kvs
         // output to writer:
         for (Cell c : kvs) {
           KeyValue kv = KeyValueUtil.ensureKeyValue(c);
           if (kv.getMvccVersion() <= smallestReadPoint) {
             kv.setMvccVersion(0);
           }
+          // 将处理后的 KeyValue 写入新的 HFile
           writer.append(kv);
           int len = kv.getLength();
           ++progress.currentCompactedKVs;

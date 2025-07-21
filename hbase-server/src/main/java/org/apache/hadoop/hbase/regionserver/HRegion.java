@@ -1568,6 +1568,22 @@ public class HRegion implements HeapSize { // , Writable{
     return compact(compaction, store, throughputController, null);
   }
 
+  /**
+   * 这个方法负责获取 Region 级别的锁，并协调 Store 级别的 Compaction。
+   * ● 前置检查：如果 Region 正在关闭或已关闭，则跳过 Compaction。
+   * ● 获取 Region 读锁 (lock.readLock().lock())：
+   *   ○ 保证在 Compaction 期间，Region 不会被关闭、分裂或合并。
+   *   ○ 允许正常的读写操作与 Compaction 并发进行。
+   * ● 更新 Compaction 状态：在 writestate 锁的保护下，递增 compacting 计数器。
+   * ● 核心委托: 将实际的文件合并工作委托给 HStore 的 compact 方法。这是整个过程中最耗时的部分。
+   * ● 在 finally 块中递减 compacting 计数器并释放 Region 读锁。
+   * @param compaction
+   * @param store
+   * @param throughputController
+   * @param user
+   * @return
+   * @throws IOException
+   */
   public boolean compact(CompactionContext compaction, Store store,
       CompactionThroughputController throughputController, User user) throws IOException {
     assert compaction != null && compaction.hasSelection();
@@ -1687,6 +1703,7 @@ public class HRegion implements HeapSize { // , Writable{
     MonitoredTask status = TaskMonitor.get().createStatus("Flushing " + this);
     status.setStatus("Acquiring readlock on region");
     // block waiting for the lock for flushing cache
+    // 获取 Region 的读锁
     lock.readLock().lock();
     try {
       if (this.closed.get()) {
@@ -1695,6 +1712,8 @@ public class HRegion implements HeapSize { // , Writable{
         status.abort(msg);
         return new FlushResult(FlushResult.Result.CANNOT_FLUSH, msg);
       }
+
+      // 执行 pre-flush 协处理器钩子
       if (coprocessorHost != null) {
         status.setStatus("Running coprocessor pre-flush hooks");
         coprocessorHost.preFlush();
@@ -1703,6 +1722,8 @@ public class HRegion implements HeapSize { // , Writable{
         numMutationsWithoutWAL.set(0);
         dataInMemoryWithoutWAL.set(0);
       }
+
+      // 同步 writestate，原子地将 flushing 标志设为 true
       synchronized (writestate) {
         if (!writestate.flushing && writestate.writesEnabled) {
           this.writestate.flushing = true;
@@ -1720,8 +1741,10 @@ public class HRegion implements HeapSize { // , Writable{
         }
       }
       try {
+        // 调用包含三阶段核心逻辑的内部方法
         FlushResult fs = internalFlushcache(status);
 
+        // 执行 post-flush 协处理器钩子
         if (coprocessorHost != null) {
           status.setStatus("Running post-flush coprocessor hooks");
           coprocessorHost.postFlush();
@@ -1818,6 +1841,25 @@ public class HRegion implements HeapSize { // , Writable{
    * @return true if the region needs compacting
    * @throws IOException
    * @see #internalFlushcache(MonitoredTask)
+   *
+   *
+   *
+   * 阶段一：准备 (Prepare) - 在 updatesLock 写锁保护下
+   *   ○ 获取 updatesLock 写锁：这个锁会阻塞所有新的写（Put/Delete）和读（Get/Scan）操作。这个过程必须非常快。
+   *   ○ 推进 MVCC: 调用 mvcc.beginMemstoreInsert() 和 mvcc.advanceMemstore()，获取一个“写凭证”（WriteEntry），并将 memstoreReadPoint 推进到当前的最大“读点”。这确保了快照创建后发生的新写入，其 MVCC 编号会大于当前快照。
+   *   ○ 获取 Flush 序列号: 从 WAL 获取一个唯一的、递增的 flushSeqId。
+   *   ○ 创建 MemStore 快照: 遍历 Region 内的所有 Store，调用 store.snapshot()。这个方法会用一个新的、空的 ConcurrentSkipListMap 替换当前的 MemStore，并将旧的 MemStore（现在是快照）保存起来。
+   *   ○ 释放 updatesLock 写锁: 快照创建完成，立即释放写锁，允许新的读写操作进入。
+   * 阶段二：执行 (Execute) - 并发写入 HFile
+   * 6. 等待旧事务完成: 调用 mvcc.waitForRead(w)，阻塞等待所有在“准备阶段”开始前就已经开始的写事务完成。这确保了快照中不包含任何未完成的事务。
+   * 7. 并发刷写: 遍历所有 Store 的快照，调用 flush.flushCache()。这一步是 I/O 密集型操作，会将内存中的快照数据写入到 HDFS 上的一个临时 HFile 中。这个过程可以并发执行（如果配置了多线程 flush）。
+   * 阶段三：提交 (Commit) - 原子切换与清理
+   * 8. 提交 HFile: 遍历所有 Store，调用 flush.commit()。这个方法会：
+   * a. 将临时目录下的 HFile 原子地移动到该列族（Store）的正式目录下。
+   * b. 更新 Store 的文件列表，让新的 HFile 对读操作可见。
+   * 9. 写入 WAL 完成标记: 调用 wal.completeCacheFlush(...)，向 WAL 中写入一条特殊的标记，告诉 WAL 清理器，所有序列号小于等于 flushSeqId 的日志对于这个 Region 来说已经不再需要了，可以被归档或删除。
+   * 10. 清理快照: MemStore 的快照被丢弃，其内存被垃圾回收。
+   * 11. 更新状态: 更新 Region 的 lastFlushTime 和 completeSequenceId。
    */
   protected FlushResult internalFlushcache(
       final HLog wal, final long myseqid, MonitoredTask status)
@@ -1879,6 +1921,7 @@ public class HRegion implements HeapSize { // , Writable{
           status.setStatus(msg);
           return new FlushResult(FlushResult.Result.CANNOT_FLUSH, msg);
         }
+        //   获取 Flush 序列号: 从 WAL 获取一个唯一的、递增的 flushSeqId。
         flushSeqId = this.sequenceId.incrementAndGet();
       } else {
         // use the provided sequence Id as WAL is not being used for this flush.
@@ -1894,10 +1937,14 @@ public class HRegion implements HeapSize { // , Writable{
 
       // prepare flush (take a snapshot)
       // 4. 准备 flush (实际执行 snapshot 动作)
+      //   创建 MemStore 快照: 遍历 Region 内的所有 Store，调用 store.snapshot()。
+      //   这个方法会用一个新的、空的 ConcurrentSkipListMap 替换当前的 MemStore，
+      //   并将旧的 MemStore（现在是快照）保存起来。
       for (StoreFlushContext flush : storeFlushCtxs.values()) {
         flush.prepare();
       }
     } finally {
+      // 放 updatesLock 写锁: 快照创建完成，立即释放写锁，允许新的读写操作进入。
       this.updatesLock.writeLock().unlock();
     }
     boolean compactionRequested = false;
@@ -2298,6 +2345,8 @@ public class HRegion implements HeapSize { // , Writable{
     startRegionOperation(Operation.PUT);
     try {
       // All edits for the given row (across all column families) must happen atomically.
+      // 核心：所有 Put/Delete 操作都通过一个统一的批量处理方法 doBatchMutate
+      // 即便只有一个 Put，也把它当作只有一个元素的批次来处理。
       doBatchMutate(put);
     } finally {
       closeRegionOperation(Operation.PUT);
@@ -2447,6 +2496,7 @@ public class HRegion implements HeapSize { // , Writable{
     // 1. 启动 Region 操作，获取读锁
     startRegionOperation(op);
     try {
+      // 2. 循环处理，因为一个大批次可能被拆分成多个微批次执行
       while (!batchOp.isDone()) {
         if (!batchOp.isInReplay()) {
           checkReadOnly();
@@ -2455,14 +2505,16 @@ public class HRegion implements HeapSize { // , Writable{
 
         if (!initialized) {
           this.writeRequestsCount.add(batchOp.operations.length);
-          // 2. 准备操作，包括运行协处理器 pre-hooks
+          // 3. 准备阶段：执行协处理器 preBatchMutate 钩子
           if (!batchOp.isInReplay()) {
             doPreMutationHook(batchOp);
           }
           initialized = true;
         }
-        // 3. 执行一个“微批次”
+        // 4. 执行核心的微批处理逻辑
         doMiniBatchMutation(batchOp);
+
+        // 5. 检查 MemStore 大小，如果达到阈值，则请求刷写
         long newSize = this.getMemstoreSize().get();
         if (isFlushSize(newSize)) {
           requestFlush();
@@ -2549,6 +2601,13 @@ public class HRegion implements HeapSize { // , Writable{
       // STEP 1. Try to acquire as many locks as we can, and ensure
       // we acquire at least one.
       // ----------------------------------
+      /**
+       * ● 在一个 while 循环中，遍历批次中待处理的 Mutation。
+       * ● 对每个 Mutation 的行键，调用 getRowLockInternal() 尝试获取行锁。
+       * ● 行锁确保了在同一时刻，只有一个线程能修改某一行的数据，这是实现行级原子性的关键。
+       * ● 为了提高吞吐量，它会尝试一次性获取多个不同行的锁，形成一个“微批次”。如果遇到某个行锁被占用，它不会一直等待（除非是批次的第一个操作），而是停止收集，处理已获取锁的行。
+       * ● 同时，此步骤会进行合法性校验（checkFamilies, checkRow 等），无效的操作会被标记并跳过。
+       */
       int numReadyToWrite = 0;
       long now = EnvironmentEdgeManager.currentTimeMillis();
       while (lastIndexExclusive < batchOp.operations.length) {
@@ -2670,6 +2729,13 @@ public class HRegion implements HeapSize { // , Writable{
       // ------------------------------------
       // STEP 2. Update any LATEST_TIMESTAMP timestamps
       // ----------------------------------
+      /**
+       * Step 2: 更新时间戳 (Update Timestamps)
+       * ● 在获取所有锁之后，获取当前时间戳。
+       * ● 遍历微批次中的所有 Mutation，如果 Cell 的时间戳是 HConstants.LATEST_TIMESTAMP，
+       * 则用刚刚获取的当前时间戳替换它。这保证了同一批次内的所有操作具有相同的时间戳，
+       * 并且这个时间戳是在获取锁之后生成的。
+       */
       for (int i = firstIndex; i < lastIndexExclusive; i++) {
         // skip invalid
         if (batchOp.retCodeDetails[i].getOperationStatusCode()
@@ -2688,6 +2754,13 @@ public class HRegion implements HeapSize { // , Writable{
         rewriteCellTags(familyMaps[i], mutation);
       }
 
+      /**
+       * Step 3: 写入 MemStore (Write to MemStore)
+       * ● 获取 Region 级别的 updatesLock.readLock()，这是一个读写锁的读锁，防止在批量写入期间发生 major compaction 等结构性变更。
+       * ● 获取 MVCC 写凭证: 调用 mvcc.beginMemstoreInsert()，这会从 MultiVersionConsistencyControl 中获取一个“写编号”（Write Number）。
+       * ● 遍历微批次，将每个 Mutation 的所有 Cell 写入到对应的 MemStore 中。
+       * ● 关键点：此时写入 MemStore 的数据对读操作是不可见的。因为它们的“写编号”还没有被“提交”（complete）。这是一种先写内存的优化。
+       */
       lock(this.updatesLock.readLock(), numReadyToWrite);
       locked = true;
 
@@ -2726,6 +2799,12 @@ public class HRegion implements HeapSize { // , Writable{
       // ------------------------------------
       // STEP 4. Build WAL edit
       // ----------------------------------
+      /**
+       * Step 4: 构建 WALEdit (Build WAL Edit)
+       * ● 遍历微批次，对于每个需要持久化的 Mutation (Durability 不是 SKIP_WAL)：
+       * ● 将其所有 Cell 添加到之前创建的 walEdit 对象中。
+       * ● 协处理器也可能向 walEdit 中添加数据。
+       */
       boolean hasWalAppends = false;
       Durability durability = Durability.USE_DEFAULT;
       for (int i = firstIndex; i < lastIndexExclusive; i++) {
@@ -2780,6 +2859,11 @@ public class HRegion implements HeapSize { // , Writable{
       // -------------------------
       // STEP 5. Append the final edit to WAL. Do not sync wal.
       // -------------------------
+      /**
+       * Step 5: 追加 WAL (Append to WAL)
+       * ● 如果 walEdit 不为空，调用 this.log.appendNoSync(...) 将整个 walEdit 对象作为一个原子单元追加到 HLog (WAL) 的末尾。
+       * ● NoSync 意味着此时只是将数据写入了文件系统的缓冲区，尚未强制刷写到磁盘。这是一个性能优化，将多个操作的刷盘合并为一次。
+       */
       Mutation mutation = batchOp.getMutation(firstIndex);
       if (walEdit.size() > 0) {
         txid = this.log.appendNoSync(this.getRegionInfo(), this.htableDescriptor.getTableName(),
@@ -2791,6 +2875,11 @@ public class HRegion implements HeapSize { // , Writable{
       // -------------------------------
       // STEP 6. Release row locks, etc.
       // -------------------------------
+      /**
+       * Step 6: 释放行锁 (Release Row Locks)
+       * ● 数据已经安全地写入内存和 WAL 缓冲区，可以立即释放所有行锁，让其他线程能够处理这些行。这最大化了行锁的持有时间，提高了并发性。
+       * ● 同时释放 updatesLock。
+       */
       if (locked) {
         this.updatesLock.readLock().unlock();
         locked = false;
@@ -2800,6 +2889,12 @@ public class HRegion implements HeapSize { // , Writable{
       // -------------------------
       // STEP 7. Sync wal.
       // -------------------------
+      /**
+       * Step 7: 同步 WAL (Sync WAL)
+       * ● 根据批次中最高的持久化级别（Durability），调用 syncOrDefer()。
+       * ● 如果 Durability 是 SYNC_WAL 或 FSYNC_WAL，此方法会阻塞，直到 WAL 的缓冲区被强制刷写到磁盘上。
+       * ● 这是数据持久化的保证：一旦 sync 完成，即使 RegionServer 宕机，数据也可以从 WAL 中恢复。
+       */
       if (hasWalAppends) {
         syncOrDefer(txid, durability);
       }
@@ -2815,6 +2910,12 @@ public class HRegion implements HeapSize { // , Writable{
       // ------------------------------------------------------------------
       // STEP 8. Advance mvcc. This will make this put visible to scanners and getters.
       // ------------------------------------------------------------------
+      /**
+       * Step 8: 提交 MVCC (Advance MVCC)
+       * ● 调用 mvcc.completeMemstoreInsert(w)，将之前获取的“写编号”标记为“已完成”。
+       * ● 这是数据可见性的保证：一旦 MVCC 编号被提交，新的读操作（Scanner 或 Get）就能够看到这批写入的数据了。
+       * ● 这个“先刷盘，后可见”的顺序（Write-Ahead Log 原则）是保证数据一致性的核心。
+       */
       if (w != null) {
         mvcc.completeMemstoreInsert(w);
         w = null;
@@ -3451,12 +3552,16 @@ public class HRegion implements HeapSize { // , Writable{
     if (this.rsServices == null) {
       return;
     }
+    // 同步 writestate 对象，这是一个轻量级锁，用于保护 flush 状态位
     synchronized (writestate) {
+      // 如果已经有一个 flush 请求在排队或正在进行，则无需重复请求
       if (this.writestate.isFlushRequested()) {
         return;
       }
       writestate.flushRequested = true;
     }
+    // 在同步块之外发起请求，避免长时间持有锁 (HBASE-818)
+    // this.rsServices.getFlushRequester() 返回的是 MemStoreFlusher 实例
     // Make request outside of synchronize block; HBASE-818.
     this.rsServices.getFlushRequester().requestFlush(this);
     if (LOG.isDebugEnabled()) {
@@ -4146,9 +4251,19 @@ public class HRegion implements HeapSize { // , Writable{
    */
   class RegionScannerImpl implements RegionScanner {
     // Package local for testability
+
+    // 核心数据结构。这是一个最小堆，其中存放的是来自各个 StoreScanner 的 KeyValue（或称 Cell）。
+    // storeHeap.peek() 总能返回整个 Region 中排序最靠前（行键最小、列最小、时间戳最大）的那个 KeyValue。
+    // 这是实现多路归并排序的关键。
     KeyValueHeap storeHeap = null;
+
     /** Heap of key-values that are not essential for the provided filters and are thus read
      * on demand, if on-demand column family loading is enabled.*/
+    // 按需加载优化。这是一个可选的最小堆。
+    // 当启用了 "on-demand column family loading" 优化时，那些不被过滤器（Filter）
+    // 认为是“必需”的列族对应的 StoreScanner 会被放入 joinedHeap。
+    // 只有当 storeHeap 中的数据通过了过滤器，并且确定需要获取该行的完整数据时，
+    // 才会去 joinedHeap 中拉取非必需列族的数据，从而减少不必要的 I/O。
     KeyValueHeap joinedHeap = null;
     /**
      * If the joined heap data gathering is interrupted due to scan limits, this will
@@ -4156,11 +4271,13 @@ public class HRegion implements HeapSize { // , Writable{
     protected KeyValue joinedContinuationRow = null;
     // KeyValue indicating that limit is reached when scanning
     private final KeyValue KV_LIMIT = new KeyValue();
+    // 扫描的结束行。当 storeHeap 堆顶元素的行键达到或超过 stopRow 时，扫描结束。
     protected final byte[] stopRow;
     private final FilterWrapper filter;
     private int batch;
     protected int isScan;
     private boolean filterClosed = false;
+    // MVCC 读点。这是一个时间戳，本次扫描只能看到时间戳小于等于 readPt 的数据版本，确保了读取的一致性快照。
     private long readPt;
     private long maxResultSize;
     protected HRegion region;
@@ -4193,6 +4310,8 @@ public class HRegion implements HeapSize { // , Writable{
 
       // synchronize on scannerReadPoints so that nobody calculates
       // getSmallestReadPoint, before scannerReadPoints is updated.
+
+      // 获取读点（readPt）：根据 Scan 的隔离级别（IsolationLevel），从 HRegion 获取一个 MVCC 读点。
       IsolationLevel isolationLevel = scan.getIsolationLevel();
       synchronized(scannerReadPoints) {
         this.readPt = getReadpoint(isolationLevel);
@@ -4201,6 +4320,10 @@ public class HRegion implements HeapSize { // , Writable{
 
       // Here we separate all scanners into two lists - scanner that provide data required
       // by the filter to operate (scanners list) and all others (joinedScanners list).
+
+      /** 对于每个列族，调用 store.getScanner(...) 方法，创建一个 StoreScanner。
+       * 这个 StoreScanner 内部已经整合了该列族的 MemStore 和所有 HFile。
+       */
       List<KeyValueScanner> scanners = new ArrayList<KeyValueScanner>(scan.getFamilyMap().size());
       List<KeyValueScanner> joinedScanners =
           new ArrayList<KeyValueScanner>(scan.getFamilyMap().size());
@@ -4230,6 +4353,7 @@ public class HRegion implements HeapSize { // , Writable{
             joinedScanners.add(scanner);
           }
         }
+        // 使用创建好的 StoreScanner 列表来初始化 KeyValueHeap
         initializeKVHeap(scanners, joinedScanners, region);
       } catch (Throwable t) {
         throw handleException(instantiatedScanners, t);
@@ -4433,6 +4557,9 @@ public class HRegion implements HeapSize { // , Writable{
         }
 
         // Let's see what we have in the storeHeap.
+        /** 查看堆顶：调用 this.storeHeap.peek() 获取当前全局排序最靠前的 KeyValue (current)。
+        这个 KeyValue 决定了当前正在处理的行 (currentRow)。
+         */
         KeyValue current = this.storeHeap.peek();
 
         byte[] currentRow = null;
@@ -4443,6 +4570,11 @@ public class HRegion implements HeapSize { // , Writable{
           offset = current.getRowOffset();
           length = current.getRowLength();
         }
+        /**
+         * ● 检查终止条件：
+         *   ○ 到达 Stop Row：isStopRow(currentRow) 判断当前行是否已经越过了扫描的终点。如果是，扫描结束，返回 false。
+         *   ○ 客户端断开连接：检查 RPC 调用是否已超时或客户端已断开，如果是，则抛出异常，防止服务器做无用功。
+         */
         boolean stopRow = isStopRow(currentRow, offset, length);
         // Check if we were getting data from the joinedHeap and hit the limit.
         // If not, then it's main path - getting results from storeHeap.
@@ -4457,13 +4589,18 @@ public class HRegion implements HeapSize { // , Writable{
 
           // Check if rowkey filter wants to exclude this row. If so, loop to next.
           // Technically, if we hit limits before on this row, we don't need this call.
+          // 调用 filterRowKey()，让过滤器有机会基于行键提前过滤掉整行，如果被过滤，则跳到下一行（nextRow()）并重新开始 while 循环。
           if (filterRowKey(currentRow, offset, length)) {
             boolean moreRows = !isFilterDoneInternal() && nextRow(currentRow, offset, length);
             if (!moreRows) return false;
             results.clear();
             continue;
           }
-
+          /**
+           *   ○ 调用 populateResult(results, this.storeHeap, ...)。
+           *   ○ 此方法会从 storeHeap 中不断地调用 next()，将所有属于 currentRow 的 KeyValue 提取出来，
+           *     放入 results 列表，直到遇到下一行的数据或达到 limit（如 batch 或 maxResultSize）限制。
+           */
           KeyValue nextKv = populateResult(results, this.storeHeap, limit, currentRow, offset,
               length);
           // Ok, we are good, let's try to get some results from the main heap.
@@ -4482,11 +4619,21 @@ public class HRegion implements HeapSize { // , Writable{
 
           // We have the part of the row necessary for filtering (all of it, usually).
           // First filter with the filterRow(List).
+          /**
+           * ● 单元格级过滤：
+           *   ○ 数据填充完毕后，调用 filter.filterRowCells(results)。
+           *   ○ 过滤器会对 results 列表中的每个 KeyValue 进行检查，并可能将其移除。这是最精细的过滤阶段。
+           */
           FilterWrapper.FilterRowRetCode ret = FilterWrapper.FilterRowRetCode.NOT_CALLED;
           if (filter != null && filter.hasFilterRow()) {
             ret = filter.filterRowCellsWithRet(results);
           }
 
+          /**
+           * ● 整行过滤：
+           *   ○ 在单元格过滤后，再次检查过滤器是否要过滤掉整行（例如，因为必需的列不存在）。
+           *   如果 results 变为空或者过滤器明确指示要排除，则清空 results，跳到下一行，重新开始 while 循环。
+           */
           if ((isEmptyRow || ret == FilterWrapper.FilterRowRetCode.EXCLUDE) || filterRow()) {
             results.clear();
             boolean moreRows = nextRow(currentRow, offset, length);
@@ -4498,6 +4645,12 @@ public class HRegion implements HeapSize { // , Writable{
             return false;
           }
 
+          /**
+           *
+           * ● 填充非必需数据（joinedHeap）：
+           *   ○ 如果主数据（storeHeap）已经通过了所有过滤，并且存在 joinedHeap，此时才去 joinedHeap 中拉取非必需列族的数据。
+           *   ○ 调用 populateFromJoinedHeap()，其逻辑与 populateResult 类似，将属于 currentRow 的数据从 joinedHeap 中提取并加入 results 列表。
+           */
           // Ok, we are done with storeHeap for this row.
           // Now we may need to fetch additional, non-essential data into row.
           // These values are not needed for filter to work, so we postpone their
@@ -5299,11 +5452,25 @@ public class HRegion implements HeapSize { // , Writable{
        }
     }
     // 2. 将 Get 请求包装成一个 Scan 请求
+    /**
+     * ● Get 到 Scan 的转换（核心思想）：
+     *   ○ HRegion 对象接收到 Get 请求后，并不会直接去查找数据。相反，它会立即将这个 Get 对象包装成一个 Scan 对象。
+     *   ○ 这个特制的 Scan 的**起始行（startRow）和结束行（stopRow）**都被设置为 Get 请求的目标行键。这精确地将扫描范围限定在了我们感兴趣的唯一一行上。
+     */
     Scan scan = new Scan(get);
     // 3. 获取 RegionScanner
     RegionScanner scanner = null;
     try {
       // 4. 从 Scanner 中拉取数据
+      /**
+       * ● 创建层级化的扫描器（Scanner Hierarchy）：
+       *   ○ HRegion 为这个特制的 Scan 创建一个临时的 RegionScanner。这个创建过程是层级化的：
+       *     ■ Region 级别：RegionScanner 是顶层扫描器，负责协调其下的所有数据源。
+       *     ■ Store (列族) 级别：RegionScanner 会为 Get 请求中涉及的每一个列族（Store）创建一个 StoreScanner。
+       *     ■ 数据源级别：每一个 StoreScanner 内部又会为两个主要数据源创建扫描器：
+       *       ● MemStoreScanner：用于扫描内存中尚未刷写到磁盘的最新数据。
+       *       ● HFileScanner：为该 Store 下的每一个 HFile（已持久化的数据文件）创建一个扫描器。
+       */
       scanner = getScanner(scan);
       scanner.next(results);
     } finally {

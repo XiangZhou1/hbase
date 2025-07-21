@@ -1169,6 +1169,9 @@ public class HStore implements Store {
           + StringUtils.humanReadableInt(cr.getSize()));
 
       // Commence the compaction.
+      // 1. **执行文件合并**
+      //    compaction.compact() 内部会创建 scanners, writer，并执行数据泵送
+      //    最终返回新生成的临时 HFile 的路径列表
       List<Path> newFiles = compaction.compact(throughputController, user);
 
       // TODO: get rid of this!
@@ -1186,8 +1189,13 @@ public class HStore implements Store {
         return sfs;
       }
       // Do the steps necessary to complete the compaction.
+      // 2. **原子切换**
+      //    a. 将临时 HFile 移动到正式目录
       sfs = moveCompatedFilesIntoPlace(cr, newFiles, user);
+      //    b. [可选] 写入一条 WAL 记录，标记此次 compaction
       writeCompactionWalRecord(filesToCompact, sfs);
+      //    c. 在 StoreFileManager 中，用新的 HFile 列表原子地替换掉旧的文件列表
+      //       从这一刻起，所有新创建的 Scanner 将使用新的 HFile
       replaceStoreFiles(filesToCompact, sfs);
       if (cr.isMajor()) {
         majorCompactedCellsCount += getCompactionProgress().totalCompactingKVs;
@@ -1197,6 +1205,8 @@ public class HStore implements Store {
         compactedCellsSize += getCompactionProgress().totalCompactedSize;
       }
       // At this point the store will use new files for all new scanners.
+      // 3. **清理旧文件**
+      //    这一步会归档并最终删除旧的 HFile
       completeCompaction(filesToCompact); // Archive old files & update store size.
 
       logCompactionEndMessage(cr, sfs, compactionStartTime);
@@ -1471,10 +1481,15 @@ public class HStore implements Store {
     // Before we do compaction, try to get rid of unneeded files to simplify things.
     removeUnneededFiles();
 
+    // 创建一个 CompactionContext，它会持有 compaction 过程中的所有状态
     final CompactionContext compaction = storeEngine.createCompaction();
+    // 获取 Store 级别的读锁，防止在选择文件时，文件列表发生变更
     this.lock.readLock().lock();
     try {
+      // 同步 filesCompacting 集合，这是一个正在进行 compaction 的文件列表
       synchronized (filesCompacting) {
+        // 1. [可选] 协处理器钩子：preCompactSelection
+        //    给用户代码一个机会来覆盖默认的文件选择逻辑
         final Store thisStore = this;
         // First, see if coprocessor would want to override selection.
         if (this.getCoprocessorHost() != null) {
@@ -1505,11 +1520,15 @@ public class HStore implements Store {
         }
 
         // Normal case - coprocessor is not overriding file selection.
+        // 2. 默认文件选择逻辑
         if (!compaction.hasSelection()) {
           boolean isUserCompaction = priority == Store.PRIORITY_USER;
           boolean mayUseOffPeak = offPeakHours.isOffPeakHour() &&
               offPeakCompactionTracker.compareAndSet(false, true);
           try {
+            // ... 判断是否是用户请求、是否处于非高峰期 ...
+            // 调用 compaction 策略（如 ExploringCompactionPolicy）的 select 方法
+            // 这是算法核心，根据 ratio, min/max files 等配置选择文件
             compaction.select(this.filesCompacting, isUserCompaction,
               mayUseOffPeak, forceMajor && filesCompacting.isEmpty());
           } catch (IOException e) {
@@ -1559,7 +1578,7 @@ public class HStore implements Store {
         if (selectedFiles.isEmpty()) {
           return null;
         }
-
+        // 将选中的文件加入到 filesCompacting 集合中，防止被其他任务重复选择
         addToCompactingFiles(selectedFiles);
 
         // If we're enqueuing a major, clear the force flag.

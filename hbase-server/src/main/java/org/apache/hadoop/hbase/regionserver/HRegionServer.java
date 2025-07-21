@@ -292,6 +292,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   //RegionName vs current action in progress
   //true - if open region action in progress
   //false - if close region action in progress
+  /**
+   * 跟踪正在进行状态转换（打开或关闭）的 Region。true 表示正在打开，false 表示正在关闭。这用于防止对同一个 Region 同时进行打开和关闭操作。
+   */
   protected final ConcurrentMap<byte[], Boolean> regionsInTransitionInRS =
     new ConcurrentSkipListMap<byte[], Boolean>(Bytes.BYTES_COMPARATOR);
 
@@ -302,6 +305,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   protected long maxScannerResultSize;
 
   // Cache flushing
+  // 一个后台线程/服务，负责监控所有 Region 的 MemStore 使用情况，并在需要时触发刷写操作。
   protected MemStoreFlusher cacheFlusher;
 
   protected HeapMemoryManager hMemManager;
@@ -323,6 +327,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   protected ReplicationSinkService replicationSinkHandler;
 
   // Compactions
+  // 一个后台线程/服务，负责处理所有的 Compaction 和 Split 请求。
   public CompactSplitThread compactSplitThread;
 
   final ConcurrentHashMap<String, RegionScannerHolder> scanners =
@@ -331,6 +336,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   /**
    * Map of regions currently being served by this region server. Key is the
    * encoded region name.  All access should be synchronized.
+   * 核心数据结构。存储了当前 HRegionServer 上所有在线并提供服务的 Region。
+   * Key 是 Region 的编码名称（Encoded Name），Value 是 HRegion 对象本身。
    */
   protected final Map<String, HRegion> onlineRegions =
     new ConcurrentHashMap<String, HRegion>();
@@ -355,6 +362,10 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       .synchronizedMap(new HashMap<String, HRegion>());
 
   // Leases
+
+  // 租约管理器。主要用于管理 Scanner 的租约。
+  // 如果客户端在一段时间内没有继续从一个 Scanner 读取数据，租约会过期，
+  // 服务器会自动关闭这个 Scanner，释放资源。
   protected Leases leases;
 
   // Instance of the hbase executor service.
@@ -546,6 +557,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    * never flushed to disk, it will be part of recovery), or we'll see it as part of the nonce
    * log (or both occasionally, which doesn't matter). Nonce log file can be deleted after the
    * latest nonce in it expired. It can also be recovered during move.
+   *
+   * Nonce（随机数）管理器，用于实现客户端操作（如 increment, append）的幂等性。
    */
   private final ServerNonceManager nonceManager;
 
@@ -885,6 +898,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   @Override
   public void run() {
     try {
+      /**
+       * 步骤 1: 执行预注册初始化；例如 zookeeper, lease 线程等。
+       *   ○ 连接 ZooKeeper。
+       *   ○ 启动 MasterAddressTracker，阻塞等待，直到在 ZooKeeper 中发现可用的 Master。
+       *   ○ 启动 ClusterStatusTracker，阻塞等待，直到 Master 在 ZooKeeper 中将集群状态设置为 "up"。
+       *   ○ 初始化各种后台线程/服务，如 MemStoreFlusher, CompactSplitThread 等。如果此阶段失败，服务器将中止 (abort)。
+       */
       // Do pre-registration initializations; zookeeper, lease threads, etc.
       preRegistrationInitialization();
     } catch (Throwable e) {
@@ -895,11 +915,25 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       // Try and register with the Master; tell it we are here.  Break if
       // server is stopped or the clusterup flag is down or hdfs went wacky.
       while (keepLooping()) {
+        /**
+         * ● 向 Master 注册 (reportForDuty):
+         *   ○ 在一个循环中，尝试调用 reportForDuty() 向 Master 发送注册请求。
+         *   ○ 此请求包含了 RS 的地址、端口和启动代码 (startcode)。
+         *   ○ 如果成功，Master 会返回一些集群配置（如 HDFS 的 rootdir）以及 Master 视角下此 RS 的正式名称 (serverNameFromMasterPOV)。
+         */
         RegionServerStartupResponse w = reportForDuty();
         if (w == null) {
           LOG.warn("reportForDuty failed; sleeping and then retrying.");
           this.sleeper.sleep();
         } else {
+          /**
+           * ● 处理注册响应并上线 (handleReportForDutyResponse):
+           *   ○ 应用从 Master 获取的配置。
+           *   ○ 在 ZooKeeper 的 /hbase/rs/ 目录下创建自己的临时节点，标志着自己已上线。
+           *   ○ 基于最终配置，初始化 HLog (WAL)。
+           *   ○ 启动所有服务线程，最重要的是启动 RPC 服务器 (rpcServer.start())，开始接受客户端和 Master 的请求。
+           *   ○ 设置 isOnline = true。
+           */
           handleReportForDutyResponse(w);
           break;
         }
@@ -945,6 +979,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         }
         long now = System.currentTimeMillis();
         if ((now - lastMsg) >= msgInterval) {
+          // 心跳汇报: 定期（由 msgInterval 控制）调用 tryRegionServerReport()，向 Master 发送心跳，汇报自身负载情况。
           tryRegionServerReport(lastMsg, now);
           lastMsg = System.currentTimeMillis();
         }
@@ -957,6 +992,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       }
     }
     // Run shutdown.
+    // 步骤 5: 运行关闭程序。
+    // ... 执行一系列的清理和关闭操作 ...
+    // 例如：注销 MBean, 关闭 lease, 停止 RPC Server, 关闭 BlockCache, 关闭 HLog 等。
     if (mxBean != null) {
       MBeanUtil.unregisterMBean(mxBean);
       mxBean = null;
@@ -2998,8 +3036,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       final GetRequest request) throws ServiceException {
     long before = EnvironmentEdgeManager.currentTimeMillis();
     try {
+      // 1. 检查服务器是否健康
       checkOpen();
       requestCount.increment();
+
+      // 2. 根据请求中的 RegionSpecifier 找到对应的 HRegion 对象
+      // 这是关键的一步，如果找不到 Region，会抛出 NotServingRegionException
       HRegion region = getRegion(request.getRegion());
 
       GetResponse.Builder builder = GetResponse.newBuilder();
@@ -3017,11 +3059,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         byte[] family = get.getColumn(0).getFamily().toByteArray();
         r = region.getClosestRowBefore(row, family);
       } else {
+        // 3. 将 protobuf 的 Get 对象转换为 HBase 内部的 Get 对象
         Get clientGet = ProtobufUtil.toGet(get);
         if (get.getExistenceOnly() && region.getCoprocessorHost() != null) {
           existence = region.getCoprocessorHost().preExists(clientGet);
         }
         if (existence == null) {
+          // 4. 将实际的 get 操作委托给 HRegion 对象
           r = region.get(clientGet);
           if (get.getExistenceOnly()) {
             boolean exists = r.getExists();
@@ -3032,6 +3076,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           }
         }
       }
+
+      // 5. 将 HRegion 返回的 Result 对象封装到 RPC 响应中
       if (existence != null){
         ClientProtos.Result pbr = ProtobufUtil.toResult(existence);
         builder.setResult(pbr);
@@ -3073,6 +3119,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       if (!region.getRegionInfo().isMetaTable()) {
         cacheFlusher.reclaimMemStoreMemory();
       }
+
+      /**
+       * Nonce 管理 (幂等性): 如果请求带有 Nonce（随机数），会调用 startNonceOperation。
+       * ServerNonceManager 会检查这个 Nonce 是否已经成功执行过。
+       * 如果执行过，会抛出 OperationConflictException，防止重复写入。
+        */
       long nonceGroup = request.hasNonceGroup()
           ? request.getNonceGroup() : HConstants.NO_NONCE;
       Result r = null;
@@ -3089,6 +3141,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         break;
       case PUT:
         Put put = ProtobufUtil.toPut(mutation, cellScanner);
+        // checkAndPut
         if (request.hasCondition()) {
           Condition condition = request.getCondition();
           byte[] row = condition.getRow().toByteArray();
@@ -3947,11 +4000,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   public OpenRegionResponse openRegion(final RpcController controller,
       final OpenRegionRequest request) throws ServiceException {
     try {
+      // 1. 检查服务器是否正在运行
       checkOpen();
     } catch (IOException ie) {
       throw new ServiceException(ie);
     }
     requestCount.increment();
+    // 检查此 RPC 是否是发给正确的 RS 实例的
     if (request.hasServerStartCode() && this.serverNameFromMasterPOV != null) {
       // check that we are the same server that this RPC is intended for.
       long serverStartCode = request.getServerStartCode();
@@ -3968,7 +4023,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     final boolean isBulkAssign = regionCount > 1;
 
     long masterSystemTime = request.hasMasterSystemTime() ? request.getMasterSystemTime() : -1;
-
+    // 遍历待打开的 Region:
     for (RegionOpenInfo regionOpenInfo : request.getOpenInfoList()) {
       final HRegionInfo region = HRegionInfo.convert(regionOpenInfo.getRegion());
 
@@ -3978,6 +4033,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       }
       HTableDescriptor htd;
       try {
+        // 2. 检查 Region 是否已在线
+        //   状态检查: 检查这个 Region 是否已经在此 RS 上在线 (getFromOnlineRegions)。如果是，并且 meta 表也确认它属于此 RS，那么可能是一个重复的请求，直接忽略并返回成功。
         final HRegion onlineRegion = getFromOnlineRegions(region.getEncodedName());
         if (onlineRegion != null) {
           //Check if the region can actually be opened.
@@ -4014,7 +4071,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           htd = this.tableDescriptors.get(region.getTable());
           htds.put(region.getTable(), htd);
         }
-
+        // 3. 并发控制：使用 ConcurrentMap 原子地更新 Region 的转换状态
+        // putIfAbsent 返回 key 之前关联的 value，如果之前没有映射，则返回 null。
+        // true 代表 OPEN，false 代表 CLOSE
         final Boolean previous = this.regionsInTransitionInRS.putIfAbsent(
             region.getEncodedNameAsBytes(), Boolean.TRUE);
 
@@ -4058,6 +4117,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           // If there is no action in progress, we can submit a specific handler.
           // Need to pass the expected version in the constructor.
           if (region.isMetaRegion()) {
+            // 异步执行: 创建一个 OpenRegionHandler (或 OpenMetaHandler 等特殊 Handler) 任务。
+            // 这个 Handler 封装了所有打开 Region 的复杂逻辑（如从 HDFS 加载文件、重放 WAL 等）。
             this.service.submit(new OpenMetaHandler(this, this, region, htd,
                 versionOfOfflineNode, masterSystemTime));
           } else {
