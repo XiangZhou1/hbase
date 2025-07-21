@@ -114,15 +114,20 @@ class AsyncProcess<CResult> {
   protected static final AtomicLong COUNTER = new AtomicLong();
   protected final long id;
   private final int startLogErrorsCnt;
+  // 用于定位 Region、获取 RPC stub 等。
   protected final HConnection hConnection;
   protected final TableName tableName;
+  // 执行 RPC 调用的线程池。通常由 HTable 共享。
   protected final ExecutorService pool;
+  // 处理成功和失败的回调接口。
   protected final AsyncProcessCallback<CResult> callback;
   protected final BatchErrors errors = new BatchErrors();
   protected final AtomicBoolean hasError = new AtomicBoolean(false);
+  // 用于跟踪已发送和已完成的任务数，是实现并发控制的基础。
   protected final AtomicLong tasksSent = new AtomicLong(0);
   protected final AtomicLong tasksDone = new AtomicLong(0);
   protected final AtomicLong retriesCnt = new AtomicLong(0);
+  // 两个 ConcurrentMap，精确地跟踪每个 Server 和每个 Region 上正在执行的任务数。
   protected final ConcurrentMap<byte[], AtomicInteger> taskCounterPerRegion =
       new ConcurrentSkipListMap<byte[], AtomicInteger>(Bytes.BYTES_COMPARATOR);
   protected final ConcurrentMap<ServerName, AtomicInteger> taskCounterPerServer =
@@ -311,16 +316,20 @@ class AsyncProcess<CResult> {
 
     // This looks like we are keying by region but HRegionLocation has a comparator that compares
     // on the server portion only (hostname + port) so this Map collects regions by server.
+    // actionsByServer: 按目标 RegionServer 对操作进行分组，Key 是 HRegionLocation
     Map<HRegionLocation, MultiAction<Row>> actionsByServer =
       new HashMap<HRegionLocation, MultiAction<Row>>();
+    // retainedActions: 存储本轮成功筛选出的、将要被发送的操作
     List<Action<Row>> retainedActions = new ArrayList<Action<Row>>(rows.size());
 
     long currentTaskCnt = tasksDone.get();
     boolean alreadyLooped = false;
 
     NonceGenerator ng = this.hConnection.getNonceGenerator();
+    // **核心调度循环**：持续尝试，直到至少提交了一批操作（如果 atLeastOne=true）
     do {
       if (alreadyLooped){
+        // 如果不是第一次循环，说明上次没能提交任何任务，现在需要阻塞等待有任务完成
         // if, for whatever reason, we looped, we want to be sure that something has changed.
         waitForNextTaskDone(currentTaskCnt);
         currentTaskCnt = tasksDone.get();
@@ -340,11 +349,13 @@ class AsyncProcess<CResult> {
       Iterator<? extends Row> it = rows.iterator();
       while (it.hasNext()) {
         Row r = it.next();
+        // 1. 定位操作的目标 RegionServer
         HRegionLocation loc = findDestLocation(r, posInList);
 
         if (loc == null) { // loc is null if there is an error such as meta not available.
           it.remove();
         } else if (canTakeOperation(loc, regionIncluded, serverIncluded)) {
+          // 2. **核心流控决策**：检查是否可以向该目标发送更多请求
           Action<Row> action = new Action<Row>(r, ++posInList);
           setNonce(ng, r, action);
           retainedActions.add(action);
@@ -355,6 +366,7 @@ class AsyncProcess<CResult> {
     } while (retainedActions.isEmpty() && atLeastOne && !hasError());
 
     HConnectionManager.ServerErrorTracker errorsByServer = createServerErrorTracker();
+    // **异步发送**: 将分组好的 actionsByServer 提交到线程池执行，方法立即返回
     sendMultiAction(retainedActions, actionsByServer, 1, errorsByServer, batchCallback, null);
   }
 
@@ -427,19 +439,20 @@ class AsyncProcess<CResult> {
                                      Map<ServerName, Boolean> serversIncluded) {
     HRegionInfo regionInfo = loc.getRegionInfo();
     Boolean regionPrevious = regionsIncluded.get(regionInfo);
-
+    // 检查之前是否已对该 Region 做出决策
     if (regionPrevious != null) {
       // We already know what to do with this region.
       return regionPrevious;
     }
 
     Boolean serverPrevious = serversIncluded.get(loc.getServerName());
+    // 检查之前是否已对该 Server 做出决策（如果已判定为满，则直接拒绝）
     if (Boolean.FALSE.equals(serverPrevious)) {
       // It's a new region, on a region server that we have already excluded.
       regionsIncluded.put(regionInfo, Boolean.FALSE);
       return false;
     }
-
+    // **Region 级别流控**: 检查该 Region 上正在飞行的任务数是否已达上限
     AtomicInteger regionCnt = taskCounterPerRegion.get(loc.getRegionInfo().getRegionName());
     if (regionCnt != null && regionCnt.get() >= maxConcurrentTasksPerRegion) {
       // Too many tasks on this region already.

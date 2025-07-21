@@ -1572,6 +1572,7 @@ public class HRegion implements HeapSize { // , Writable{
       CompactionThroughputController throughputController, User user) throws IOException {
     assert compaction != null && compaction.hasSelection();
     assert !compaction.getRequest().getFiles().isEmpty();
+    // 1. **前置检查**：如果 Region 正在关闭或已关闭，则跳过 Compaction。
     if (this.closing.get() || this.closed.get()) {
       LOG.debug("Skipping compaction on " + this + " because closing/closed");
       store.cancelRequestedCompaction(compaction);
@@ -1580,6 +1581,9 @@ public class HRegion implements HeapSize { // , Writable{
     MonitoredTask status = null;
     boolean requestNeedsCancellation = true;
     // block waiting for the lock for compaction
+    // 2. **获取 Region 读锁**：
+    //    - 保证在 Compaction 期间，Region 不会被关闭、分裂或合并。
+    //    - 允许正常的读写操作与 Compaction 并发进行。
     lock.readLock().lock();
     try {
       byte[] cf = Bytes.toBytes(store.getColumnFamilyName());
@@ -1599,6 +1603,7 @@ public class HRegion implements HeapSize { // , Writable{
       }
       boolean wasStateSet = false;
       try {
+        // 4. **更新 Compaction 状态**：在 writestate 锁的保护下，递增 compacting 计数器。
         synchronized (writestate) {
           if (writestate.writesEnabled) {
             wasStateSet = true;
@@ -1617,6 +1622,8 @@ public class HRegion implements HeapSize { // , Writable{
           status.setStatus("Compacting store " + store);
           // We no longer need to cancel the request on the way out of this
           // method because Store#compact will clean up unconditionally
+          // 5. **核心委托**: 将实际的文件合并工作委托给 HStore 的 compact 方法。
+          //    这是整个过程中最耗时的部分。
           requestNeedsCancellation = false;
           store.compact(compaction, throughputController, user);
         } catch (InterruptedIOException iioe) {
@@ -1639,9 +1646,11 @@ public class HRegion implements HeapSize { // , Writable{
       return true;
     } finally {
       try {
+        // 如果 HStore.compact 未被调用就发生异常，需要在这里取消请求。
         if (requestNeedsCancellation) store.cancelRequestedCompaction(compaction);
         if (status != null) status.cleanup();
       } finally {
+        // 7. **释放 Region 读锁**：在方法退出前，必须释放锁。
         lock.readLock().unlock();
       }
     }
@@ -1846,6 +1855,9 @@ public class HRegion implements HeapSize { // , Writable{
     // rows then)
     status.setStatus("Obtaining lock to block concurrent updates");
     // block waiting for the lock for internal flush
+    // ===================================================================
+    // 阶段一：准备阶段 (Prepare) - 在 updatesLock 写锁保护下创建快照
+    // ===================================================================
     this.updatesLock.writeLock().lock();
     long totalFlushableSize = 0;
     status.setStatus("Preparing to flush by snapshotting stores");
@@ -1855,9 +1867,11 @@ public class HRegion implements HeapSize { // , Writable{
     long flushSeqId = -1L;
     try {
       // Record the mvcc for all transactions in progress.
+      // 1. 从 MVCC 获取一个新的写事务，并推进 memstoreReadPoint
       w = mvcc.beginMemstoreInsert();
       mvcc.advanceMemstore(w);
       // check if it is not closing.
+      // 2. 获取本次 Flush 的唯一序列号 (Sequence ID)
       if (wal != null) {
         if (!wal.startCacheFlush(this.getRegionInfo().getEncodedNameAsBytes())) {
           String msg = "Flush will not be started for ["
@@ -1870,7 +1884,7 @@ public class HRegion implements HeapSize { // , Writable{
         // use the provided sequence Id as WAL is not being used for this flush.
         flushSeqId = myseqid;
       }
-
+      // 3. 遍历所有 Store，为它们的 MemStore 创建快照
       for (Store s : stores.values()) {
         totalFlushableSize += s.getFlushableSize();
         byte[] storeName = s.getFamily().getName();
@@ -1879,6 +1893,7 @@ public class HRegion implements HeapSize { // , Writable{
       }
 
       // prepare flush (take a snapshot)
+      // 4. 准备 flush (实际执行 snapshot 动作)
       for (StoreFlushContext flush : storeFlushCtxs.values()) {
         flush.prepare();
       }
@@ -1903,6 +1918,11 @@ public class HRegion implements HeapSize { // , Writable{
       // uncommitted transactions from being written into HFiles.
       // We have to block before we start the flush, otherwise keys that
       // were removed via a rollbackMemstore could be written to Hfiles.
+      // ===================================================================
+      // 阶段二：执行阶段 (Execute) - 并发写入 HFile
+      // ===================================================================
+
+      // 5. 等待所有在快照创建前开始的写事务完成
       mvcc.waitForRead(w);
 
       s = "Flushing stores of " + this;
@@ -1918,15 +1938,26 @@ public class HRegion implements HeapSize { // , Writable{
       // just-made new flush store file. The new flushed file is still in the
       // tmp directory.
 
+      // 6. 遍历所有 Store 的快照，并将它们的数据写入 HDFS 上的临时 HFile
       for (StoreFlushContext flush : storeFlushCtxs.values()) {
         flush.flushCache(status);
       }
 
+      // ===================================================================
+      // 阶段三：提交阶段 (Commit) - 原子切换和清理
+      // ===================================================================
+
+      // 7. 遍历所有 Store，提交 flush 结果
       // Switch snapshot (in memstore) -> new hfile (thus causing
       // all the store scanners to reset/reseek).
       for (Map.Entry<byte[], StoreFlushContext> flushEntry : storeFlushCtxs.entrySet()) {
         byte[] storeName = flushEntry.getKey();
         StoreFlushContext flush = flushEntry.getValue();
+        // flush.commit() 内部会：
+        // a. 将临时 HFile 原子地移动到正式目录
+        // b. 创建新的 StoreFile 对象
+        // c. 更新 StoreFileManager 的文件列表
+        // d. 清理 MemStore 快照
         boolean needsCompaction = flush.commit(status);
         if (needsCompaction) {
           compactionRequested = true;
@@ -1938,6 +1969,7 @@ public class HRegion implements HeapSize { // , Writable{
       storeFlushCtxs.clear();
 
       // Set down the memstore size by amount of flush.
+      // 8. 更新 Region 级别的 MemStore 大小计数器
       this.addAndGetGlobalMemstoreSize(-totalFlushableSize);
     } catch (Throwable t) {
       // An exception here means that the snapshot was not persisted.
@@ -1969,11 +2001,14 @@ public class HRegion implements HeapSize { // , Writable{
     }
 
     // If we get to here, the HStores have been written.
+    // 9. **向 WAL 写入 Flush 完成标记**
+    //    这告诉 WAL 清理器，所有 SeqId <= flushSeqId 的日志都可以被清理了。
     if (wal != null) {
       wal.completeCacheFlush(this.getRegionInfo().getEncodedNameAsBytes());
     }
 
     // Record latest flush time
+    // 10. 更新 Region 的状态
     this.lastFlushTime = EnvironmentEdgeManager.currentTimeMillis();
 
     // Update the last flushed sequence id for region
@@ -2101,6 +2136,12 @@ public class HRegion implements HeapSize { // , Writable{
     }
   }
 
+
+
+  // RegionScannerImpl 的构造函数是核心
+  // 它会为 HRegion 内的每个 HStore 创建一个 StoreScanner
+  // StoreScanner 内部又会为 MemStore 和每个 HFile 创建 Scanner
+  // 最终形成一个由 KeyValueHeap 驱动的、合并了所有数据源的扫描器
   protected RegionScanner instantiateRegionScanner(Scan scan,
       List<KeyValueScanner> additionalScanners) throws IOException {
     if (scan.isReversed()) {
@@ -5250,17 +5291,19 @@ public class HRegion implements HeapSize { // , Writable{
 
     List<Cell> results = new ArrayList<Cell>();
 
+    // 1. 调用协处理器 pre-get hook
     // pre-get CP hook
     if (withCoprocessor && (coprocessorHost != null)) {
        if (coprocessorHost.preGet(get, results)) {
          return results;
        }
     }
-
+    // 2. 将 Get 请求包装成一个 Scan 请求
     Scan scan = new Scan(get);
-
+    // 3. 获取 RegionScanner
     RegionScanner scanner = null;
     try {
+      // 4. 从 Scanner 中拉取数据
       scanner = getScanner(scan);
       scanner.next(results);
     } finally {

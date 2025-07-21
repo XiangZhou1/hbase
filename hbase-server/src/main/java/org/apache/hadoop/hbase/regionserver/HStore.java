@@ -153,12 +153,18 @@ public class HStore implements Store {
    *   - closing
    *   - completing a compaction
    */
+  // **Store 级读写锁**：保护 Store 内部结构，特别是 HFile 列表的修改。
+  // - **读锁**: 在所有数据读写操作（如创建 Scanner）时获取，允许多个读操作并发。
+  // - **写锁**: 在修改 HFile 列表时获取，例如在 Compaction 完成后或关闭 Store 时。
   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
   private final boolean verifyBulkLoads;
 
   // 缓存了与扫描相关的列族配置，如 TTL（Time-To-Live）、maxVersions 等，用于在扫描时进行数据过滤。
   private ScanInfo scanInfo;
 
+  // **正在合并的文件列表**：一个非常关键的列表，用于并发控制。
+  // 它记录了当前正在被 Compaction 的 HFile。Compaction 策略在选择文件时会排除此列表中的文件，
+  // 从而避免同一个文件被重复合并。
   // TODO: ideally, this should be part of storeFileManager, as we keep passing this to it.
   final List<StoreFile> filesCompacting = Lists.newArrayList();
 
@@ -176,6 +182,10 @@ public class HStore implements Store {
   // Comparing KeyValues
   private final KeyValue.KVComparator comparator;
 
+  // **可插拔的存储引擎**。这是一个关键的抽象，它封装了 HStore 的核心策略，包括：
+  // 1. StoreFileManager: 管理磁盘上的 HFile 列表。
+  // 2. CompactionPolicy: 决定何时以及如何进行 Compaction。
+  // 3. StoreFlusher: 定义如何将 MemStore 数据刷写到 HFile。
   final StoreEngine<?, ?, ?, ?> storeEngine;
 
   private static final AtomicBoolean offPeakCompactionTracker = new AtomicBoolean();
@@ -821,20 +831,26 @@ public class HStore implements Store {
     // 'snapshot', the next time flush comes around.
     // Retry after catching exception when flushing, otherwise server will abort
     // itself
+    // 获取 StoreFlusher，它定义了具体的刷写逻辑
     StoreFlusher flusher = storeEngine.getStoreFlusher();
     IOException lastException = null;
     for (int i = 0; i < flushRetriesNumber; i++) {
       try {
+        // 1. **核心调用**: 调用 flusher 将内存快照 (snapshot) 写入一个新的 HFile。
+        //    这个新文件被创建在 HDFS 的临时目录 (.tmp) 下。
         List<Path> pathNames = flusher.flushSnapshot(
             snapshot, logCacheFlushId, snapshotTimeRangeTracker, flushedSize, status);
         Path lastPathName = null;
         try {
+
+          // 2. **验证文件**: 对新生成的 HFile 进行健康检查，确保文件没有损坏。
           for (Path pathName : pathNames) {
             lastPathName = pathName;
             validateStoreFile(pathName);
           }
           return pathNames;
         } catch (Exception e) {
+          // 3. **异常处理与重试**: 如果刷写或验证失败，记录异常并准备重试。
           LOG.warn("Failed validating store file " + lastPathName + ", retrying num=" + i, e);
           if (e instanceof IOException) {
             lastException = (IOException) e;
