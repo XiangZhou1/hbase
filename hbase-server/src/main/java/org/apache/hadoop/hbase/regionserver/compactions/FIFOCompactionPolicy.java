@@ -43,6 +43,18 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
  * which creates roll up aggregates and compacts time-series, the original raw data
  * can be discarded after that.
  *
+ * FIFOCompactionPolicy 将一个 Store（列族）视为一个有时效性的数据队列。HFile 被不断地从队尾加入（通过 Flush），
+ * 当一个 HFile 已经足够“老”，以至于其内部所有的 Cell 都已经因为 TTL (Time-To-Live) 而过期时，这个 HFile 就会被从队头整个丢弃。它几乎不进行数据合并，而是直接删除整个过期的 HFile。
+ * 与默认策略的根本区别：
+ * ● 默认策略（如 Exploring）：目标是合并数据以优化读取性能和回收空间。它会读取多个 HFile 的内容，进行归并排序，然后写入新的 HFile。
+ * ● FIFO 策略：目标是丢弃数据。它不关心文件内部的数据，只关心整个文件是否过期。它避免了昂贵的读写合并操作，通过直接删除文件来回收空间，效率极高。
+ *
+ *
+ * FIFOCompactionPolicy 是一个为特定场景设计的、高度优化的“丢弃”策略。它通过完全放弃数据合并，只关注 HFile 的整体过期，从而实现了极高效的空间回收。它与默认的 Compaction 策略在目标和行为上都有着根本性的差异。其关键逻辑在于：
+ * ● 依赖 TTL: 必须为列族设置 TTL。
+ * ● 检查最大时间戳: 通过比较 文件的最大时间戳 + TTL 与当前时间，来判断整个文件是否过期。
+ * ● 不进行合并: 它选择出来的“合并”请求，实际上是让 Compaction 框架去执行一个输入为 N 个文件、输出为 0 个文件的操作，从而达到删除输入文件的目的。
+ * ● 特殊情况处理: 它能正确识别并处理 Region Split 后必须进行的 Major Compaction，临时退化为父类的行为来保证数据一致性。
  */
 @InterfaceAudience.Private
 public class FIFOCompactionPolicy extends ExploringCompactionPolicy {
@@ -58,10 +70,12 @@ public class FIFOCompactionPolicy extends ExploringCompactionPolicy {
   public CompactionRequest selectCompaction(Collection<StoreFile> candidateFiles,
       List<StoreFile> filesCompacting, boolean isUserCompaction, boolean mayUseOffPeak,
       boolean forceMajor) throws IOException {
-
+    // 1. Major Compaction 对 FIFO 策略无意义，直接忽略
     if(forceMajor){
       LOG.warn("Major compaction is not supported for FIFO compaction policy. Ignore the flag.");
     }
+
+    // 2. 如果检测到 Region 刚分裂过 (存在引用文件)
     boolean isAfterSplit = StoreUtils.hasReferences(candidateFiles);
     if(isAfterSplit){
       LOG.info("Split detected, delegate selection to the parent policy.");
@@ -70,6 +84,7 @@ public class FIFOCompactionPolicy extends ExploringCompactionPolicy {
     }
 
     // Nothing to compact
+    // 3. 正常情况下，选择所有已过期的文件进行 "compaction" (实为丢弃)
     Collection<StoreFile> toCompact = getExpiredStores(candidateFiles, filesCompacting);
     CompactionRequest result = new CompactionRequest(toCompact);
     return result;

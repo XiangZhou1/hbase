@@ -35,6 +35,7 @@ import org.apache.hadoop.hbase.regionserver.StoreFile;
  *
  * This class will search all possibilities for different and if it gets stuck it will choose
  * the smallest set of files to compact.
+ * ExploringCompactionPolicy 则不同，它会探索（遍历）所有可能的、连续的 HFile 组合，并从中找出一个“最佳”的合并方案。
  */
 @InterfaceAudience.Private
 public class ExploringCompactionPolicy extends RatioBasedCompactionPolicy {
@@ -71,7 +72,22 @@ public class ExploringCompactionPolicy extends RatioBasedCompactionPolicy {
 
     int opts = 0, optsInRatio = 0, bestStart = -1; // for debug logging
     // Consider every starting place.
+    /**
+     * ● 双重循环遍历:
+     *   ○ 外层循环 (for start ...): 遍历所有 HFile，将每一个文件作为潜在合并区间的起点。
+     *   ○ 内层循环 (for currentEnd ...): 从 start 开始，不断向后扩展，将每一个文件作为潜在合并区间的终点。
+     *   ○ 通过这两个循环，potentialMatchFiles = candidates.subList(start, currentEnd + 1) 就生成了一个所有可能的、连续的 HFile 组合。
+     */
     for (int start = 0; start < candidates.size(); start++) {
+      /**
+       * ● 评估每个潜在组合 (potentialMatchFiles):
+       *   ○ 合法性检查:
+       *     ■ 组合中的文件数必须在 minFiles 和 maxFiles 之间。
+       *     ■ 组合的总大小不能超过 maxCompactSize。
+       *   ○ 存储最小组合: 如果 Store 可能卡住，并且当前组合的总大小比已知的 smallestSize 还小，则更新 smallest 和 smallestSize。
+       *   ○ Ratio 检查 (filesInRatio): 这是一个关键的筛选条件。一个组合只有在其内部所有文件都满足 Ratio 约束时，才被认为是“健康的”。filesInRatio 会检查组合中的每一个文件，确保它的FileSize <= (组合总大小 - 该文件大小) * ratio。这个检查防止了将一个“巨无霸”文件和一堆“小不点”文件合并在一起的低效情况。
+       *   ○ 比较与选择 (isBetterSelection): 如果一个组合通过了上述所有检查，就调用 isBetterSelection 将它与当前已知的 bestSelection 进行比较，以决定是否更新最佳选择。
+       */
       // Consider every different sub list permutation in between start and end with min files.
       for (int currentEnd = start + minFiles - 1;
           currentEnd < candidates.size(); currentEnd++) {

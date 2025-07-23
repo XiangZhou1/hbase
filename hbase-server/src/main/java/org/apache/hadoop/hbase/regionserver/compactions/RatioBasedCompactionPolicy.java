@@ -58,8 +58,17 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
       return result;
     }
     // TODO: Use better method for determining stamp of last major (HBASE-2990)
+    /**
+     * ● 检查最旧文件的时间戳:
+     *   ○ 获取当前 Store 中所有 HFile 里最旧的那个文件的时间戳（lowTimestamp）。
+     */
     long lowTimestamp = StoreUtils.getLowestTimestamp(filesToCompact);
     long now = System.currentTimeMillis();
+    /**
+     * ● 时间比较:
+     *   ○ 用当前时间 now 减去 lowTimestamp，得到最旧文件的“年龄”。
+     *   ○ 如果这个“年龄”大于配置的 Major Compaction 周期 (mcTime)，则基本确定需要进行 Major Compaction。
+     */
     if (lowTimestamp > 0l && lowTimestamp < (now - mcTime)) {
       // Major compaction time has elapsed.
       long cfTtl = this.storeConfigInfo.getStoreFileTtl();
@@ -68,6 +77,13 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
         StoreFile sf = filesToCompact.iterator().next();
         Long minTimestamp = sf.getMinimumTimestamp();
         long oldest = (minTimestamp == null) ? Long.MIN_VALUE : now - minTimestamp.longValue();
+        /**
+         * ● 特殊情况处理:
+         *   ○ TTL (Time-To-Live): 如果 Store 设置了 TTL，并且最旧文件的年龄已经超过了 TTL，那么为了清理过期数据，也必须触发 Major Compaction。
+         *   ○ 数据本地性 (Block Locality): 如果 Store 中只有一个 HFile，并且它已经经过了 Major Compaction，正常情况下不需要再次合并。
+         *   但如果这个文件的 HDFS 数据块在本地节点上的比例很低（低于 hbase.hstore.min.locality.to.force.major.compact），
+         *   为了提升数据本地性、优化读性能，也会强制触发一次 Major Compaction。
+         */
         if (sf.isMajorCompaction() && (cfTtl == Long.MAX_VALUE || oldest < cfTtl)) {
           float blockLocalityIndex =
               sf.getHDFSBlockDistribution().getBlockLocalityIndex(
@@ -108,13 +124,22 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
   protected CompactionRequest getCompactionRequest(ArrayList<StoreFile> candidateSelection,
       boolean tryingMajor, boolean isUserCompaction, boolean mayUseOffPeak, boolean mayBeStuck)
       throws IOException {
+    /**
+     * ● 判断是否是 Major Compaction (!tryingMajor):
+     *   ○ 如果不是 Major Compaction（即是 Minor Compaction），则执行以下步骤。如果是 Major Compaction，则默认选择所有文件，直接跳到步骤 2。
+     *   ○ filterBulk(...): 根据配置，排除掉 Bulk Load 进来的文件。
+     *   ○ applyCompactionPolicy(...): 这是 Ratio 策略的核心算法所在，下面会详细讲解。它会根据 Ratio 算法筛选出一组合适的文件。
+     *   ○ checkMinFilesCriteria(...): 检查筛选出的文件数量是否达到了最小合并数（hbase.hstore.compaction.min.files），如果不够，则取消本次 Compaction。
+     */
     if (!tryingMajor) {
       candidateSelection = filterBulk(candidateSelection);
       candidateSelection = applyCompactionPolicy(candidateSelection, mayUseOffPeak, mayBeStuck);
       candidateSelection =
           checkMinFilesCriteria(candidateSelection, comConf.getMinFilesToCompact());
     }
+    // removeExcessFiles(...): 确保最终选择的文件数不超过最大合并数（hbase.hstore.compaction.max.files）。
     removeExcessFiles(candidateSelection, isUserCompaction, tryingMajor);
+    // 创建并返回 CompactionRequest: 将最终确定的文件列表包装成一个 CompactionRequest 对象返回。
     CompactionRequest result = new CompactionRequest(candidateSelection);
     result.setOffPeak(!candidateSelection.isEmpty() && !tryingMajor && mayUseOffPeak);
     return result;
@@ -135,6 +160,12 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
    *         compactions. normal skew: older ----> newer (increasing seqID) _ | | _ | | | | _ --|-|-
    *         |-|- |-|---_-------_------- minCompactSize | | | | | | | | _ | | | | | | | | | | | | |
    *         | | | | | | | | | | | | |
+   *
+   *
+   * 从最旧的文件开始，逐个检查每个文件 (F) 是否满足合并条件。一个文件 F 满足条件，当且仅当它的大小小于或等于所有比它更新的文件的总大小乘以一个比例 (ratio)。
+   * size(F) <= sum(size(all_newer_files)) * ratio
+   * 这个算法的直观理解是：一个文件只有在它相对于后面（更新的）那些文件的总和来说“足够小”的时候，才值得被合并。
+   * 如果一个文件自己已经很大了，而后面的文件都很小，那么合并的开销会很大，但收益（减少的文件数）却很小，性价比低。
    */
   protected ArrayList<StoreFile> applyCompactionPolicy(ArrayList<StoreFile> candidates,
       boolean mayUseOffPeak, boolean mayBeStuck) throws IOException {
@@ -151,9 +182,17 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
     }
 
     // get store file sizes for incremental compacting selection.
+    // 预计算文件大小和后缀和
+    /**
+     * ● 预计算:
+     *   ○ 获取所有候选 HFile 的大小，存入 fileSizes 数组。
+     *   ○ 为了快速计算 sum(size(all_newer_files))，它会预先计算一个后缀和数组 sumSize。sumSize[i] 存储了从 fileSizes[i] 到 fileSizes[i + maxFilesToCompact - 1] 的文件大小之和（有一个窗口限制）。
+     */
     final int countOfFiles = candidates.size();
     long[] fileSizes = new long[countOfFiles];
     long[] sumSize = new long[countOfFiles];
+
+
     for (int i = countOfFiles - 1; i >= 0; --i) {
       StoreFile file = candidates.get(i);
       fileSizes[i] = file.getReader().length();
@@ -164,9 +203,12 @@ public class RatioBasedCompactionPolicy extends SortedCompactionPolicy {
               - ((tooFar < countOfFiles) ? fileSizes[tooFar] : 0);
     }
 
+    // 从最旧的文件 (start=0) 开始检查
     while (countOfFiles - start >= comConf.getMinFilesToCompact()
+            // // 核心条件：当前文件大小 > (所有更新文件大小之和 * ratio)
         && fileSizes[start] > Math.max(comConf.getMinCompactSize(),
           (long) (sumSize[start + 1] * ratio))) {
+      // 如果条件为真，说明当前文件太大，不合并。指针后移，检查下一个。
       ++start;
     }
     if (start < countOfFiles) {

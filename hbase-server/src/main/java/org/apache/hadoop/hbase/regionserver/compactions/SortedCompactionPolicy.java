@@ -63,6 +63,7 @@ public abstract class SortedCompactionPolicy extends CompactionPolicy {
       final List<StoreFile> filesCompacting, final boolean isUserCompaction,
       final boolean mayUseOffPeak, final boolean forceMajor) throws IOException {
     // Preliminary compaction subject to filters
+    // 获取候选文件 (candidateFiles): HStore 会传入当前所有不在正在合并队列中的 HFile，并且这些文件已经按照 Sequence ID 从旧到新排好序。
     ArrayList<StoreFile> candidateSelection = new ArrayList<StoreFile>(candidateFiles);
     // Stuck and not compacting enough (estimate). It is not guaranteed that we will be
     // able to compact more if stuck and compacting, because ratio policy excludes some
@@ -71,11 +72,26 @@ public abstract class SortedCompactionPolicy extends CompactionPolicy {
     boolean mayBeStuck = (candidateFiles.size() - filesCompacting.size() + futureFiles)
         >= storeConfigInfo.getBlockingFileCount();
 
+    // 1. 获取当前有资格参与 compaction 的文件
+    //    核心作用是排除掉比正在合并的文件更旧的文件，保证连续性
+    /**
+     * ● 处理正在合并的文件 (getCurrentEligibleFiles):
+     *   ○ 这是保证 Compaction 连续性的关键。
+     *   ○ 如果当前有文件正在被其他 Compaction 任务合并 (filesCompacting 不为空)，那么本次选择的候选文件必须是比那些正在合并的文件更新的。
+     *   ○ 它会找到 filesCompacting 中最新的那个文件，然后在 candidateFiles 列表中，把所有比这个文件旧（包括它自己）的文件全部排除掉。这样就保证了新的 Compaction 任务不会和正在进行的任务在文件区间上有重叠或间隙。
+     */
     candidateSelection = getCurrentEligibleFiles(candidateSelection, filesCompacting);
     LOG.debug("Selecting compaction from " + candidateFiles.size() + " store files, " +
         filesCompacting.size() + " compacting, " + candidateSelection.size() +
         " eligible, " + storeConfigInfo.getBlockingFileCount() + " blocking");
 
+    // 2. 如果不是 Major Compaction，则跳过那些太大的文件
+    /**
+     * ● 排除大文件 (skipLargeFiles):
+     *   ○ 如果不是强制的 Major Compaction，此方法会从候选列表的开头（即最旧的文件）开始检查。
+     *   ○ 如果一个文件的大小超过了 hbase.hstore.compaction.max.size，并且它不是一个引用文件（Reference File，必须被合并），那么这个文件和所有比它更旧的文件都会被从本次 Minor Compaction 的考虑范围中排除。
+     *   ○ 这个策略旨在避免 Minor Compaction 处理过大的文件，让其留给 Major Compaction 处理，从而保证 Minor Compaction 的快速性。
+     */
     if (!forceMajor) {
       candidateSelection = skipLargeFiles(candidateSelection);
     }
@@ -84,6 +100,15 @@ public abstract class SortedCompactionPolicy extends CompactionPolicy {
     // or if we do not have too many files to compact and this was requested
     // as a major compaction.
     // Or, if there are any references among the candidates.
+    // 3. 判断本次是否应该尝试进行 Major Compaction
+    /**
+     * ● 判断是否尝试 Major Compaction (tryingMajor):
+     *   ○ 根据一系列条件判断本次是否应该尝试进行 Major Compaction。条件包括：
+     *     ■ forceMajor 标志被设置（例如，用户手动触发）。
+     *     ■ shouldPerformMajorCompaction() 方法返回 true。这个抽象方法由子类实现，通常基于时间周期（hbase.hregion.majorcompaction）来判断。
+     *     ■ 候选文件中包含了引用文件（Reference File）。引用文件是 Region 分裂（Split）的产物，它只是指向父 Region 的 HFile 的一个链接。
+     *          这些文件必须通过 Major Compaction 来将数据真正地复制到子 Region 的新 HFile 中。
+     */
     boolean tryingMajor = (forceMajor && isUserCompaction)
       || ((forceMajor || shouldPerformMajorCompaction(candidateSelection))
           && (candidateSelection.size() < comConf.getMaxFilesToCompact()))
@@ -94,6 +119,13 @@ public abstract class SortedCompactionPolicy extends CompactionPolicy {
         + forceMajor + ", userCompaction:" + isUserCompaction);
     }
 
+    // 4. 将预处理后的文件列表和 major 标志，传递给子类去实现最终的选择算法
+    /**
+     * ● 委托给子类 (getCompactionRequest):
+     *   ○ 经过上述所有预处理后，最终的文件选择逻辑被委托给一个抽象方法 getCompactionRequest。
+     *   ○ 子类（如 RatioBasedCompactionPolicy）会在这里实现其核心算法，例如基于文件大小比例（Ratio）来决定最终要合并哪些文件。
+     *   ○ 子类实现完算法后，返回一个 CompactionRequest 对象，其中包含了最终选定的文件列表。
+     */
     return getCompactionRequest(candidateSelection, tryingMajor, isUserCompaction,
       mayUseOffPeak, mayBeStuck);
   }
