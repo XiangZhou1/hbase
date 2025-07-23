@@ -106,6 +106,21 @@ import com.google.common.annotations.VisibleForTesting;
  * <p>To read an HLog, call {@link HLogFactory#createReader(org.apache.hadoop.fs.FileSystem,
  * org.apache.hadoop.fs.Path, org.apache.hadoop.conf.Configuration)}.
  *
+ *
+ * 这个类 FSHLog（后来在更高版本中被重构为 FSHRegionWAL 等）是 HBase 中 WAL (Write-Ahead Log) 的具体实现。它的核心职责是：
+ * ● 持久化写入: 在数据被写入内存中的 MemStore 之前，所有的数据变更（Edits）必须先顺序地写入到 HLog 文件中。
+ *     这保证了即使 RegionServer 宕机，内存中的数据尚未刷写到 HFile，也可以通过回放 (replay) HLog 来恢复数据，确保数据不丢失。
+ * ● 日志滚动 (Log Rolling): 当一个 HLog 文件达到一定大小（通常是 HDFS 块大小的 95%），
+ *     或者因为其他策略（如副本数不足）触发时，系统会自动关闭当前日志文件，并创建一个新的日志文件来继续写入。这个过程对上层调用者是透明的。
+ * ● 日志清理 (Log Archiving): 当一个 HLog 文件中的所有数据变更都已经被持久化到 HFile 中（即相关的 MemStore 已经被刷写），
+ *     这个 HLog 文件就变得“过时”了。系统会将其移动到“归档”目录 (oldLogDir)，最终可以被 Master 节点的清理线程删除。
+ * 关键设计点:
+ * ● 一个 RegionServer 一个 HLog 实例: 整个 RegionServer 上的所有 Region 共享同一个 HLog 实例。这意味着所有 Region 的写入请求都会被序列化地写入到同一个日志流中。
+ * ● 异步化写入和同步: 为了提高吞吐量，FSHLog 采用了复杂的异步模型。客户端的写入请求首先被放入一个内存缓冲区 (pendingWrites)，
+ *          然后由一个独立的 AsyncWriter 线程批量写入 HDFS，再由多个 AsyncSyncer 线程负责调用 hsync()/hflush() 将数据持久化到磁盘，
+ *          最后由 AsyncNotifier 线程唤醒等待的客户端线程。这个模型旨在将多次小的 I/O 操作聚合成一次大的批量操作，以提高效率。
+ * ● Coprocessor 支持: 允许用户通过协处理器 (Coprocessor) 钩子在 WAL 写入前后执行自定义逻辑。
+ * ● 副本数检查: 能够检查 HDFS 上 WAL 文件的实际副本数，如果低于配置的阈值，会主动触发日志滚动，以期在新文件中恢复正常的副本数，增强数据可靠性。
  */
 @InterfaceAudience.Private
 class FSHLog implements HLog, Syncable {
@@ -114,17 +129,24 @@ class FSHLog implements HLog, Syncable {
   private static final int DEFAULT_SLOW_SYNC_TIME_MS = 100; // in ms
 
   private final FileSystem fs;
+  // HBase的根目录，如 /hbase
   private final Path rootDir;
+  // 当前正在写入的WAL日志文件所在目录，如 /hbase/.logs/<hostname>,<port>,<startcode>
   private final Path dir;
   private final Configuration conf;
+
+  // WAL事件监听器列表，用于协处理器、Metrics等
   // Listeners that are called on WAL events.
   private List<WALActionsListener> listeners =
     new CopyOnWriteArrayList<WALActionsListener>();
   private final long blocksize;
   private final String prefix;
+  // 尚未写入HDFS的总条目数（事务ID）
   private final AtomicLong unflushedEntries = new AtomicLong(0);
+  // 已经成功同步到HDFS的事务ID
   private final AtomicLong syncedTillHere = new AtomicLong(0);
   private long lastUnSyncedTxid;
+  // 已归档的WAL日志文件目录，如 /hbase/.oldlogs
   private final Path oldLogDir;
 
   // all writes pending on AsyncWriter/AsyncSyncer thread with
@@ -167,6 +189,8 @@ class FSHLog implements HLog, Syncable {
 
   /**
    * Map of encoded region names to their most recent sequence/edit id in their memstore.
+   * // Region 序列号管理 (用于判断WAL文件是否可以被归档)
+   * // key: region的编码名, value: 该region在memstore中最老的(未刷写)的sequence id
    */
   private final ConcurrentSkipListMap<byte [], Long> oldestUnflushedSeqNums =
     new ConcurrentSkipListMap<byte [], Long>(Bytes.BYTES_COMPARATOR);
@@ -232,14 +256,18 @@ class FSHLog implements HLog, Syncable {
   // instead of writing them to HDFS piecemeal. The goal is to increase
   // the batchsize for writing-to-hdfs as well as sync-to-hdfs, so that
   // we can get better system throughput.
+  // 本地内存缓冲区，暂存待写入的WALEdits
   private List<Entry> pendingWrites = new LinkedList<Entry>();
 
+  // 异步写入线程
   private final AsyncWriter   asyncWriter;
   // since AsyncSyncer takes much longer than other phase(add WALEdits to local
   // buffer, write local buffer to HDFS, notify pending write handler threads),
   // when a sync is ongoing, all other phase pend, we use multiple parallel
   // AsyncSyncer threads to improve overall throughput.
+  // 多个异步同步线程
   private final AsyncSyncer[] asyncSyncers;
+  // 异步通知线程
   private final AsyncNotifier asyncNotifier;
 
   /** Number of log close errors tolerated before we abort */
@@ -1006,6 +1034,7 @@ class FSHLog implements HLog, Syncable {
   private long append(HRegionInfo info, TableName tableName, WALEdit edits, List<UUID> clusterIds,
       final long now, HTableDescriptor htd, boolean doSync, boolean isInMemstore, 
       AtomicLong sequenceId, long nonceGroup, long nonce) throws IOException {
+      //  首先，append 会进行一些快速检查，比如要写入的 WALEdit 是否为空，或者 FSHLog 是否已经关闭。如果满足这些条件，它会立即返回或抛出异常，避免不必要的工作。
       if (edits.isEmpty()) return this.unflushedEntries.get();
       if (this.closed) {
         throw new IOException("Cannot append; log is closed");
@@ -1013,9 +1042,16 @@ class FSHLog implements HLog, Syncable {
       TraceScope traceScope = Trace.startSpan("FSHlog.append");
       try {
         long txid = 0;
+
+        // 获取核心锁 (updateLock): 接下来，它会进入一个 synchronized 块，获取 updateLock。
+        // 这个锁是至关重要的，它确保了 append 操作和日志滚动 (rollWriter) 操作之间是互斥的。
+        // 当日志正在滚动切换文件时，所有的 append 请求都会在此被阻塞，保证了数据写入的连续性和一致性。
         synchronized (this.updateLock) {
           // get the sequence number from the passed Long. In normal flow, it is coming from the
           // region.
+
+          // 分配序列号 (Sequence ID): 在锁内部，它会从 Region 传入的 AtomicLong 对象中获取并递增一个序列号。
+          // 这个序列号非常重要，它会跟随这条数据变更（edit）一起被写入 MemStore，成为 MVCC（多版本并发控制） 的一部分。
           long seqNum = sequenceId.incrementAndGet();
           // The 'lastSeqWritten' map holds the sequence number of the oldest
           // write for each region (i.e. the first edit added to the particular
@@ -1024,16 +1060,23 @@ class FSHLog implements HLog, Syncable {
           // is greater than or equal to the value in lastSeqWritten.
           // Use encoded name.  Its shorter, guaranteed unique and a subset of
           // actual  name.
+
+          // 记录最老序列号: FSHLog 内部有一个名为 oldestUnflushedSeqNums 的 map，它记录了每个 Region 在其 MemStore 中尚未被持久化到 HFile 的第一条 edit 的序列号。
+          // append 方法会尝试将当前 edit 的序列号作为这个“最老”的序列号存入 map。这个 map 是后续判断旧的 WAL 文件是否可以被安全删除（归档）的关键依据。
           byte [] encodedRegionName = info.getEncodedNameAsBytes();
           if (isInMemstore) this.oldestUnflushedSeqNums.putIfAbsent(encodedRegionName, seqNum);
           HLogKey logKey = makeKey(
             encodedRegionName, tableName, seqNum, now, clusterIds, nonceGroup, nonce);
 
+          // 这是 append 最核心的动作。它会将 HLogKey 和 WALEdit 包装成一个 Entry 对象，然后把它添加到一个内存中的 LinkedList 队列——pendingWrites。这个过程完全在内存中进行，速度极快。
           synchronized (pendingWritesLock) {
             doWrite(info, logKey, edits, htd);
             txid = this.unflushedEntries.incrementAndGet();
           }
           this.numEntries.incrementAndGet();
+
+          // 唤醒后台写入线程 (AsyncWriter): 将 Entry 放入缓冲区后，它会通知 (notify) AsyncWriter 线程。
+          // 这就像告诉后台的工人：“仓库里有新货了，可以开始搬运了”。
           this.asyncWriter.setPendingTxid(txid);
 
           if (htd.isDeferredLogFlush()) {
@@ -1045,6 +1088,11 @@ class FSHLog implements HLog, Syncable {
         //       Therefore, this code here is not actually used by anything.
         // Sync if catalog region, and if not then check if that table supports
         // deferred log flushing
+        /**
+         * ● 决定是否等待同步 (sync): append 方法有一个 doSync 参数。
+         *   ○ 如果 doSync 为 false（这是绝大多数数据写入的默认情况），append 方法在唤醒 AsyncWriter 后就立即返回了。此时，调用者（HRegion）可以继续将数据写入 MemStore，而无需等待数据真正落盘。
+         *   ○ 如果 doSync 为 true（例如，客户端请求了最高级别的持久性 SYNC_WAL，或者这是对 meta 表的修改），append 方法会在返回前调用 sync() 方法，并阻塞在那里，直到数据被确认持久化。
+         */
         if (doSync &&
             (info.isMetaRegion() ||
             !htd.isDeferredLogFlush())) {
@@ -1125,6 +1173,7 @@ class FSHLog implements HLog, Syncable {
           // AsyncWriter/AsyncSyncer/AsyncNotifier series. without updateLock
           // can leads to pendWrites more than pendingTxid, but not problem
           List<Entry> pendWrites = null;
+          //   被唤醒后，从 pendingWrites 缓冲区中取出所有待处理的 Entry。
           synchronized (pendingWritesLock) {
             this.txidToWrite = unflushedEntries.get();
             pendWrites = pendingWrites;
@@ -1147,6 +1196,7 @@ class FSHLog implements HLog, Syncable {
           // 4. update 'lastWrittenTxid' and notify AsyncSyncer to do 'sync'
           this.lastWrittenTxid = this.txidToWrite;
           boolean hasIdleSyncer = false;
+          //   写入完成后，更新 lastWrittenTxid，并唤醒一个空闲的 AsyncSyncer 线程，通知它可以开始同步了。
           for (int i = 0; i < asyncSyncers.length; ++i) {
             if (!asyncSyncers[i].isSyncing()) {
               hasIdleSyncer = true;
@@ -1199,11 +1249,19 @@ class FSHLog implements HLog, Syncable {
       }
     }
 
+    /**
+     *   ○ 可以有多个实例，以支持并行同步。
+     *   ○ 无限循环，等待 AsyncWriter 的通知。
+     *   ○ 被唤醒后，调用 writer.sync()。这是一个阻塞操作，它会触发 HDFS 的 hflush/hsync，强制将数据从 HDFS 客户端缓冲区刷到 DataNode 的磁盘上，并等待 DataNode 的确认。这是保证持久化的关键步骤。
+     *   ○ sync() 返回后，唤醒 AsyncNotifier 线程，告诉它一批数据已经同步完成。
+     *   ○ 检查是否需要日志滚动：检查当前日志文件大小是否超过 logrollsize，或者副本数是否过低。如果需要，则调用 requestLogRoll()。
+     */
     public void run() {
       try {
         while (!this.isInterrupted()) {
           // 1. wait until AsyncWriter has written data to HDFS and
           //    called setWrittenTxid to wake up us
+          // 等待：AsyncSyncer 线程等待 AsyncWriter 的唤醒。
           synchronized (this.syncLock) {
             while (this.writtenTxid <= this.lastSyncedTxid) {
               this.syncLock.wait();
@@ -1246,13 +1304,22 @@ class FSHLog implements HLog, Syncable {
               asyncIOE = new IOException("has unsynced writes but writer is null!");
               failedTxid.set(this.txidToSync);
             } else {
-              this.isSyncing = true;            
+              this.isSyncing = true;
+              // 执行同步 (Sync)：被唤醒后，它会调用 writer.sync()。
+              // 这是一个阻塞方法，它会触发 HDFS 的 hflush/hsync 机制，
+              // 强制将 HDFS 客户端缓冲区中的数据通过网络发送到 DataNode，
+              // 并等待 DataNode 确认数据已写入磁盘（并满足副本数要求）。
+              // 这是保证数据不丢失的决定性步骤。
               writer.sync();
               this.isSyncing = false;
             }
             postSync();
           } catch (IOException e) {
             LOG.warn("Error while AsyncSyncer sync, request close of hlog ", e);
+            /**
+             * 检查日志滚动：sync() 成功后，它会检查当前日志文件的大小是否超过阈值 (logrollsize)，或者 HDFS 副本数是否过低。
+             * 如果满足条件，它会请求进行一次日志滚动 (requestLogRoll())。
+             */
             requestLogRoll();
 
             asyncIOE = e;
@@ -1273,7 +1340,9 @@ class FSHLog implements HLog, Syncable {
 
           // 3. wake up AsyncNotifier to notify(wake-up) all pending 'put'
           // handler threads on 'sync()'
+          // 更新全局同步进度：更新内部的 lastSyncedTxid。
           this.lastSyncedTxid = this.txidToSync;
+          // 唤醒 AsyncNotifier：调用 asyncNotifier.setFlushedTxid() 并 notify() 它，告诉通知线程：“一批数据已经安全落地了！”。
           asyncNotifier.setFlushedTxid(this.lastSyncedTxid);
 
           // 4. check and do logRoll if needed
@@ -1365,7 +1434,16 @@ class FSHLog implements HLog, Syncable {
 
   // sync all transactions upto the specified txid
   private void syncer(long txid) throws IOException {
+
+    // 获取同步锁: sync 方法会进入一个 synchronized 块，获取一个名为 syncedTillHere 的共享对象的锁。
+    // syncedTillHere 是一个 AtomicLong，它记录了当前已经被后台线程成功持久化到磁盘的最后一个事务的 ID。
+    // 所有需要等待 sync 的线程都会在这个共享对象上排队等待。
     synchronized (this.syncedTillHere) {
+      /**
+       * ● 循环等待: sync 的核心是一个 while 循环。循环的条件是：syncedTillHere.get() < my_txid。
+       *   ○ 这个条件的意思是：“全局已经同步完成的进度，是否还没赶上我需要等待的进度？”
+       *   ○ 如果条件成立，当前线程就会调用 syncedTillHere.wait()。这个调用会释放锁，并让线程进入休眠等待状态。
+       */
       while (this.syncedTillHere.get() < txid) {
         try {
           this.syncedTillHere.wait();
@@ -1518,6 +1596,9 @@ class FSHLog implements HLog, Syncable {
           // set replication scope null so that this won't be replicated
           logKey.setScopes(null);
         }
+
+        // 放入内存缓冲区 (pendingWrites): 这是 append 最核心的动作。它会将 HLogKey 和 WALEdit 包装成一个 Entry 对象，
+        // 然后把它添加到一个内存中的 LinkedList 队列——pendingWrites。这个过程完全在内存中进行，速度极快。
         // write to our buffer for the Hlog file.
         this.pendingWrites.add(new HLog.Entry(logKey, logEdit));
       }
