@@ -66,6 +66,16 @@ public class MultiVersionConsistencyControl {
    * Generate and return a {@link WriteEntry} with a new write number.
    * To complete the WriteEntry and wait for it to be visible,
    * call {@link #completeMemstoreInsert(WriteEntry)}.
+   *
+   * beginMemstoreInsert() - 开始写入 / 获取票据
+   * ● 时机: 在 HRegion 准备向 MemStore 写入数据之前调用。
+   * ● 逻辑:
+   *   ○ 在 writeQueue 上加锁，保证序号分配和入队的原子性。
+   *   ○ 将 memstoreWrite 指针加一 (++memstoreWrite)，得到一个新的、唯一的 nextWriteNumber。
+   *   ○ 创建一个新的 WriteEntry 对象，封装这个 nextWriteNumber。
+   *   ○ 将这个新的 WriteEntry 添加到 writeQueue 的队尾。
+   *   ○ 返回这个 WriteEntry 对象给调用者。
+   * ● 效果: 调用者拿到了一个代表本次写操作的“票据”（WriteEntry），但此时这次写入对读者来说是不可见的，因为它还没有被提交。
    */
   public WriteEntry beginMemstoreInsert() {
     synchronized (writeQueue) {
@@ -81,6 +91,16 @@ public class MultiVersionConsistencyControl {
    *
    * At the end of this call, the global read point is at least as large as the write point
    * of the passed in WriteEntry.  Thus, the write is visible to MVCC readers.
+   *   ○ advanceMemstore(e) - 推进读点
+   *     ■ 在 writeQueue 上加锁。
+   *     ■ 调用 e.markCompleted()，将传入的 WriteEntry 标记为已完成。
+   *     ■ 核心逻辑 - 推进 memstoreRead:
+   *       ● 从 writeQueue 的队头开始检查。
+   *       ● 如果队头的 WriteEntry 是 completed 状态，就说明这个最老的、正在进行的写操作已经完成了。
+   *       ● 将 memstoreRead 更新为这个已完成的 WriteEntry 的 writeNumber。
+   *       ● 将这个已完成的 WriteEntry 从队列中移除。
+   *       ● 继续检查新的队头，只要新的队头也是 completed 状态，就重复上述过程。
+   *       ● 这个循环会一直进行，直到遇到一个尚未 completed 的 WriteEntry，或者队列为空。
    */
   public void completeMemstoreInsert(WriteEntry e) {
     advanceMemstore(e);
@@ -97,6 +117,21 @@ public class MultiVersionConsistencyControl {
    *
    * @param e
    * @return true if e is visible to MVCC readers (that is, readpoint >= e.writeNumber)
+   *
+   *   ○ advanceMemstore(e) - 推进读点
+   *     ■ 在 writeQueue 上加锁。
+   *     ■ 调用 e.markCompleted()，将传入的 WriteEntry 标记为已完成。
+   *     ■ 核心逻辑 - 推进 memstoreRead:
+   *       ● 从 writeQueue 的队头开始检查。
+   *       ● 如果队头的 WriteEntry 是 completed 状态，就说明这个最老的、正在进行的写操作已经完成了。
+   *       ● 将 memstoreRead 更新为这个已完成的 WriteEntry 的 writeNumber。
+   *       ● 将这个已完成的 WriteEntry 从队列中移除。
+   *       ● 继续检查新的队头，只要新的队头也是 completed 状态，就重复上述过程。
+   *       ● 这个循环会一直进行，直到遇到一个尚未 completed 的 WriteEntry，或者队列为空。
+   *     ■ 唤醒等待者:
+   *       ● 在 readWaiters 对象上加锁。
+   *       ● 更新全局的 memstoreRead 变量。
+   *       ● 调用 readWaiters.notifyAll()，唤醒所有可能在 waitForRead 中等待的写线程。
    */
   boolean advanceMemstore(WriteEntry e) {
     synchronized (writeQueue) {
@@ -143,6 +178,11 @@ public class MultiVersionConsistencyControl {
   /**
    * Wait for the global readPoint to advance upto
    * the specified transaction number.
+   *   ○ waitForRead(e) - 等待可见
+   *     ■ 在一个 while 循环中检查 memstoreRead < e.getWriteNumber()。
+   *     ■ 如果当前全局的读点还没有越过自己这次写入的 writeNumber，说明自己的写入对读者还不可见。
+   *     ■ 调用 readWaiters.wait(0)，使当前写线程进入等待状态，直到被 advanceMemstore 中的 notifyAll() 唤醒。
+   *     ■ 被唤醒后，重新检查循环条件。直到 memstoreRead >= e.getWriteNumber()，循环才会结束。
    */
   public void waitForRead(WriteEntry e) {
     boolean interrupted = false;

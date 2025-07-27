@@ -206,6 +206,14 @@ import com.google.protobuf.Service;
  * <p>The HTableDescriptor contains metainfo about the HRegion's table.
  * regionName is a unique identifier for this HRegion. (startKey, endKey]
  * defines the keyspace for this HRegion.
+ *
+ * 我们将从以下几个方面进行剖析：
+ * ● HRegion 整体结构与核心字段：了解 HRegion 是由哪些关键部分组成的。
+ * ● 初始化与生命周期管理 (initialize, close)：HRegion 是如何被创建、打开和关闭的。
+ * ● 写路径核心逻辑 (put, batchMutate, doWALAppend)：数据是如何被写入并保证持久化的。
+ * ● 读路径核心逻辑 (get, getScanner)：数据是如何从内存和磁盘被读取和合并的。
+ * ● 后台维护操作 (flush, compact, checkSplit)：HRegion 如何进行自我维护。
+ * ● 并发与锁机制 (updatesLock, rowLock)：HRegion 如何处理并发读写。
  */
 @InterfaceAudience.Private
 public class HRegion implements HeapSize { // , Writable{
@@ -787,6 +795,7 @@ public class HRegion implements HeapSize { // , Writable{
   private long initializeRegionInternals(final CancelableProgressable reporter,
       final MonitoredTask status) throws IOException, UnsupportedEncodingException {
     // 1. 调用协处理器 pre-open hook
+    // 调用已注册协处理器的 preOpen 方法，给用户一个在 Region 打开前执行自定义逻辑的机会。
     if (coprocessorHost != null) {
       status.setStatus("Running coprocessor pre-open hook");
       coprocessorHost.preOpen();
@@ -795,10 +804,13 @@ public class HRegion implements HeapSize { // , Writable{
     // Write HRI to a file in case we need to recover hbase:meta
     status.setStatus("Writing region info on filesystem");
     // 2. 将 .regioninfo 文件写入 HDFS，用于元数据恢复
+    // 将 HRegionInfo 对象（包含表名、start/end key等）序列化并写入 HDFS 的 Region 目录下。
+    // 这个文件是元数据恢复和完整性检查的重要依据。
     fs.checkRegionInfoOnFilesystem();
 
     // Remove temporary data left over from old regions
     status.setStatus("Cleaning up temporary data from old regions");
+    // 清理临时目录：删除上次可能遗留的临时文件（如 .tmp 目录）。
     fs.cleanupTempDir();
 
     // Initialize all the HStores
@@ -807,15 +819,23 @@ public class HRegion implements HeapSize { // , Writable{
     //    - 它会返回所有 HFile 中找到的最大 Sequence ID
     status.setStatus("Initializing all the Stores");
     // 4. 将 MVCC 的起始点推进到找到的最大 Sequence ID
+    /**
+     * ● 回放 WAL 日志 (replayRecoveredEditsIfAny)：
+     *   ○ 检查 Region 目录下是否存在 recovered.edits 文件。这些文件是 Master 在上次 RegionServer 宕机后，从 WAL 中拆分出来的、属于本 Region 的日志条目。
+     *   ○ 如果存在，HRegion 会逐条回放这些日志，将数据恢复到 MemStore 中。
+     *   ○ 回放完成后，会将 MemStore 的内容 Flush 到磁盘，形成新的 HFile，并删除 recovered.edits 文件。
+     */
     long maxSeqId = initializeRegionStores(reporter, status);
 
     status.setStatus("Cleaning up detritus from prior splits");
     // Get rid of any splits or merges that were lost in-progress.  Clean out
     // these directories here on open.  We may be opening a region that was
     // being split but we crashed in the middle of it all.
+    // 6. 清理可能失败的分裂/合并操作留下的临时目录。
     fs.cleanupAnySplitDetritus();
     fs.cleanupMergesDir();
 
+    // 根据表的 schema 设置 Region 的读写状态。
     this.writestate.setReadOnly(this.htableDescriptor.isReadOnly());
     this.writestate.flushRequested = false;
     this.writestate.compacting = 0;
@@ -850,14 +870,31 @@ public class HRegion implements HeapSize { // , Writable{
     return nextSeqid;
   }
 
+  /**
+   * 这是在线程池中并发执行的部分，每个任务对应一个 HStore 的初始化。instantiateHStore(family) 方法内部会触发以下动作：
+   * ● 创建 HStore 实例：为指定的列族 family 新建一个 HStore 对象。
+   * ● 加载 HFile：在 HStore 的初始化逻辑中（通常是构造函数或其调用的 loadStoreFiles() 方法），会执行以下 I/O 操作：
+   *   ○ 访问 HDFS，列出该 HStore 对应目录下的所有 HFile 文件。
+   *   ○ 为每一个 HFile 文件，创建一个 StoreFile 对象。
+   *   ○ 打开 HFile 的 Reader，读取文件的元数据部分（File Info Block）。
+   *   ○ 从元数据中提取并缓存关键信息，最重要的是 MAX_SEQ_ID_KEY（该 HFile 内所有 KeyValue 的最大 Sequence ID）和 TIMERANGE_KEY（时间范围）。
+   * ● 确定 HStore 级别的 maxSeqId：HStore 在加载完所有自己的 StoreFile 后，会比较所有 StoreFile 的 maxSeqId，找出其中最大的一个，作为该 HStore 自身的最大 Sequence ID。
+   * ● 返回初始化完成的 HStore：当 instantiateHStore 方法执行完毕，它返回一个完全加载了磁盘文件信息、准备就绪的 HStore 实例。
+   * @param reporter
+   * @param status
+   * @return
+   * @throws IOException
+   * @throws UnsupportedEncodingException
+   */
   private long initializeRegionStores(final CancelableProgressable reporter, MonitoredTask status)
       throws IOException, UnsupportedEncodingException {
     // Load in all the HStores.
-
-    long maxSeqId = -1;
+    // 1. 准备工作：初始化一些关键变量
+    long maxSeqId = -1;   // 用于记录整个 Region 的最大 Sequence ID
     // initialized to -1 so that we pick up MemstoreTS from column families
-    long maxMemstoreTS = -1;
+    long maxMemstoreTS = -1;   // 用于记录整个 Region 的最大 Memstore 时间戳
 
+    // 2. 检查与创建并行处理环境
     if (!htableDescriptor.getFamilies().isEmpty()) {
       // initialize the thread pool for opening stores in parallel.
       ThreadPoolExecutor storeOpenerThreadPool =
@@ -866,6 +903,7 @@ public class HRegion implements HeapSize { // , Writable{
         new ExecutorCompletionService<HStore>(storeOpenerThreadPool);
 
       // initialize each store in parallel
+      // 3. 并行提交 HStore 初始化任务
       for (final HColumnDescriptor family : htableDescriptor.getFamilies()) {
         status.setStatus("Instantiating store for column family " + family);
         completionService.submit(new Callable<HStore>() {
@@ -875,25 +913,33 @@ public class HRegion implements HeapSize { // , Writable{
           }
         });
       }
+
+      // 4. 收集并处理并行任务的结果
       boolean allStoresOpened = false;
       try {
         for (int i = 0; i < htableDescriptor.getFamilies().size(); i++) {
           Future<HStore> future = completionService.take();
           HStore store = future.get();
+          // 将初始化好的 HStore 放入 Region 的 stores 映射中
           this.stores.put(store.getColumnFamilyName().getBytes(), store);
 
+          // 获取该 Store 的最大 Sequence ID
           long storeMaxSequenceId = store.getMaxSequenceId();
+          // 记录每个 Store 的最大ID，供后续 WAL 回放精细化判断
           maxSeqIdInStores.put(store.getColumnFamilyName().getBytes(),
               storeMaxSequenceId);
+          // 更新整个 Region 的最大 Sequence ID
           if (maxSeqId == -1 || storeMaxSequenceId > maxSeqId) {
             maxSeqId = storeMaxSequenceId;
           }
+
+          // 更新整个 Region 的最大 Memstore 时间戳
           long maxStoreMemstoreTS = store.getMaxMemstoreTS();
           if (maxStoreMemstoreTS > maxMemstoreTS) {
             maxMemstoreTS = maxStoreMemstoreTS;
           }
         }
-        allStoresOpened = true;
+        allStoresOpened = true;  // 标记所有 Store 都成功打开
       } catch (InterruptedException e) {
         throw (InterruptedIOException)new InterruptedIOException().initCause(e);
       } catch (ExecutionException e) {
@@ -913,8 +959,10 @@ public class HRegion implements HeapSize { // , Writable{
         }
       }
     }
+    // 6. 初始化 MVCC
     mvcc.initialize(maxMemstoreTS + 1);
     // Recover any edits if available.
+    // 7. 回放 WAL 日志并更新 maxSeqId
     maxSeqId = Math.max(maxSeqId, replayRecoveredEditsIfAny(
         this.fs.getRegionDir(), maxSeqIdInStores, reporter, status));
     return maxSeqId;
@@ -2566,8 +2614,19 @@ public class HRegion implements HeapSize { // , Writable{
     }
   }
 
+  /**
+   * doMiniBatchMutation 的核心目标是在保证 原子性、一致性、持久性 的前提下，高效地执行一小批（mini-batch）的 Put 和 Delete 操作。
+   * 它是从一个更大的批处理请求（batchMutate）中被循环调用的，每次处理一部分。
+   *
+   * doMiniBatchMutation 的执行过程可以清晰地划分为 8 个关键步骤，
+   * 严格遵循着“先锁行 -> 写内存 -> 写日志 -> 刷盘 -> 后可见”的黄金法则。
+   * @param batchOp
+   * @return
+   * @throws IOException
+   */
   @SuppressWarnings("unchecked")
   private long doMiniBatchMutation(BatchOperationInProgress<?> batchOp) throws IOException {
+    // 标记是否是 WAL 重放操作，重放时某些检查和钩子会被跳过
     boolean isInReplay = batchOp.isInReplay();
     // variable to note if all Put items are for the same CF -- metrics related
     boolean putsCfSetConsistent = true;
@@ -2579,17 +2638,25 @@ public class HRegion implements HeapSize { // , Writable{
     Set<byte[]> deletesCfSet = null;
 
     long currentNonceGroup = HConstants.NO_NONCE, currentNonce = HConstants.NO_NONCE;
+    // WALEdit 对象，用于收集本次微批次的所有变更，以便一次性写入 WAL
     WALEdit walEdit = new WALEdit(isInReplay);
+    // WALEdit 对象，用于收集本次微批次的所有变更，以便一次性写入 WAL
     MultiVersionConsistencyControl.WriteEntry w = null;
+    // WAL 事务 ID
     long txid = 0;
+    // 标记是否需要回滚 MemStore 的写入。如果在 WAL 同步前失败，就需要回滚。
     boolean doRollBackMemstore = false;
+    // 标记是否持有了 Region 的 updatesLock.readLock()
     boolean locked = false;
 
     /** Keep track of the locks we hold so we can release them in finally clause */
+    /** 用于跟踪已获取的行锁，确保在 finally 中全部释放 */
     List<RowLock> acquiredRowLocks = Lists.newArrayListWithCapacity(batchOp.operations.length);
     // reference family maps directly so coprocessors can mutate them if desired
+    // 引用 family maps，允许协处理器在 pre-hook 中修改它们
     Map<byte[], List<Cell>>[] familyMaps = new Map[batchOp.operations.length];
     // We try to set up a batch in the range [firstIndex,lastIndexExclusive)
+    // 确定本次微批次要处理的操作在整个大批次中的索引范围 [firstIndex, lastIndexExclusive)
     int firstIndex = batchOp.nextIndexToProcess;
     int lastIndexExclusive = firstIndex;
     boolean success = false;
@@ -2610,6 +2677,7 @@ public class HRegion implements HeapSize { // , Writable{
        */
       int numReadyToWrite = 0;
       long now = EnvironmentEdgeManager.currentTimeMillis();
+      // 获取行锁 (Acquire Row Locks)
       while (lastIndexExclusive < batchOp.operations.length) {
         Mutation mutation = batchOp.getMutation(lastIndexExclusive);
         boolean isPutMutation = mutation instanceof Put;
@@ -2678,6 +2746,7 @@ public class HRegion implements HeapSize { // , Writable{
 
         // If we haven't got any rows in our batch, we should block to
         // get the next one.
+        // 尝试获取行锁。如果是微批次的第一个操作，会阻塞等待；否则非阻塞。
         boolean shouldBlock = numReadyToWrite == 0;
         RowLock rowLock = null;
         try {
@@ -2686,6 +2755,7 @@ public class HRegion implements HeapSize { // , Writable{
           LOG.warn("Failed getting lock in batch put, row="
             + Bytes.toStringBinary(mutation.getRow()), ioe);
         }
+        // // 如果获取行锁失败（锁被其他线程持有），则停止收集，结束本次微批次的准备
         if (rowLock == null) {
           // We failed to grab another lock
           break; // stop acquiring more rows for this batch
@@ -2693,8 +2763,8 @@ public class HRegion implements HeapSize { // , Writable{
           acquiredRowLocks.add(rowLock);
         }
 
-        lastIndexExclusive++;
-        numReadyToWrite++;
+        lastIndexExclusive++; // 扩展微批次的范围
+        numReadyToWrite++;  // 增加准备好的操作计数
 
         if (isPutMutation) {
           // If Column Families stay consistent through out all of the
@@ -2722,6 +2792,7 @@ public class HRegion implements HeapSize { // , Writable{
       byte[] byteNow = Bytes.toBytes(now);
 
       // Nothing to put/delete -- an exception in the above such as NoSuchColumnFamily?
+      // 如果没有任何操作准备好（例如，第一个操作就校验失败或无法获取锁），则直接返回
       if (numReadyToWrite <= 0) return 0L;
 
       // We've now grabbed as many mutations off the list as we can
@@ -2743,6 +2814,7 @@ public class HRegion implements HeapSize { // , Writable{
 
         Mutation mutation = batchOp.getMutation(i);
         if (mutation instanceof Put) {
+          // 将所有 LATEST_TIMESTAMP 的 Cell 更新为 now
           updateKVTimestamps(familyMaps[i].values(), byteNow);
           noOfPuts++;
         } else {
@@ -2761,6 +2833,7 @@ public class HRegion implements HeapSize { // , Writable{
        * ● 遍历微批次，将每个 Mutation 的所有 Cell 写入到对应的 MemStore 中。
        * ● 关键点：此时写入 MemStore 的数据对读操作是不可见的。因为它们的“写编号”还没有被“提交”（complete）。这是一种先写内存的优化。
        */
+      // 获取 Region 级别的读锁，防止在写入期间发生 Compaction 等结构性变更
       lock(this.updatesLock.readLock(), numReadyToWrite);
       locked = true;
 
@@ -2768,6 +2841,10 @@ public class HRegion implements HeapSize { // , Writable{
       // ------------------------------------
       // Acquire the latest mvcc number
       // ----------------------------------
+      // ------------------------------------------------------------------
+      // STEP 3: 写入 MemStore
+      // ------------------------------------------------------------------
+      // 3.1: 获取 MVCC 写凭证 (Write Entry)。这个凭证包含了写编号。
       w = mvcc.beginMemstoreInsert();
 
       // calling the pre CP hook for batch mutation
@@ -2775,6 +2852,7 @@ public class HRegion implements HeapSize { // , Writable{
         MiniBatchOperationInProgress<Mutation> miniBatchOp =
           new MiniBatchOperationInProgress<Mutation>(batchOp.getMutationsForCoprocs(),
           batchOp.retCodeDetails, batchOp.walEditsFromCoprocessors, firstIndex, lastIndexExclusive);
+        // 3.2: [可选] 执行协处理器 preBatchMutate 钩子
         if (coprocessorHost.preBatchMutate(miniBatchOp)) return 0L;
       }
 
@@ -2787,12 +2865,15 @@ public class HRegion implements HeapSize { // , Writable{
       // visible to scanners till we update the MVCC. The MVCC is
       // moved only when the sync is complete.
       // ----------------------------------
+      // 3.3: 遍历微批次，将数据写入 MemStore
       for (int i = firstIndex; i < lastIndexExclusive; i++) {
         if (batchOp.retCodeDetails[i].getOperationStatusCode()
             != OperationStatusCode.NOT_RUN) {
           continue;
         }
+        // 设置回滚标记。一旦开始写入 MemStore，如果后续步骤失败，就需要回滚
         doRollBackMemstore = true; // If we have a failure, we need to clean what we wrote
+        // 将 Cell 写入 MemStore，并返回增加的数据大小
         addedSize += applyFamilyMapToMemstore(familyMaps[i], w);
       }
 
@@ -2816,10 +2897,12 @@ public class HRegion implements HeapSize { // , Writable{
         batchOp.retCodeDetails[i] = OperationStatus.SUCCESS;
 
         Mutation m = batchOp.getMutation(i);
+        // 获取此操作的持久化级别，并更新批次的最高级别
         Durability tmpDur = getEffectiveDurability(m.getDurability());
         if (tmpDur.ordinal() > durability.ordinal()) {
           durability = tmpDur;
         }
+        // 如果持久化级别是 SKIP_WAL，则跳过 WAL 写入
         if (tmpDur == Durability.SKIP_WAL) {
           recordMutationWithoutWal(m.getFamilyCellMap());
           continue;
@@ -2853,6 +2936,7 @@ public class HRegion implements HeapSize { // , Writable{
             walEdit.add(kv);
           }
         }
+        // 将本次操作的 Cell 添加到 walEdit 对象中
         addFamilyMapToWALEdit(familyMaps[i], walEdit);
       }
 
@@ -2865,6 +2949,7 @@ public class HRegion implements HeapSize { // , Writable{
        * ● NoSync 意味着此时只是将数据写入了文件系统的缓冲区，尚未强制刷写到磁盘。这是一个性能优化，将多个操作的刷盘合并为一次。
        */
       Mutation mutation = batchOp.getMutation(firstIndex);
+      // 将整个 walEdit 原子地追加到 HLog 文件系统缓冲区，但不立即刷盘 (NoSync)
       if (walEdit.size() > 0) {
         txid = this.log.appendNoSync(this.getRegionInfo(), this.htableDescriptor.getTableName(),
               walEdit, mutation.getClusterIds(), now, this.htableDescriptor, this.sequenceId,
