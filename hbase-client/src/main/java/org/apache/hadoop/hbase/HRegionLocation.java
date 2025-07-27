@@ -37,7 +37,16 @@ import org.apache.hadoop.hbase.util.Addressing;
 @InterfaceStability.Evolving
 public class HRegionLocation implements Comparable<HRegionLocation> {
   private final HRegionInfo regionInfo;
+  /**
+   * 引用了一个 ServerName 对象，ServerName 封装了 RegionServer 的主机名（hostname）、
+   *   端口（port）和一个启动代码（start code，用于唯一标识一个 RegionServer 进程实例）。
+   *   这精确地指明了 Region 所在的物理服务器。
+   */
   private final ServerName serverName;
+  /**
+   *  Region 在该 ServerName 上被打开（open）时，该 RegionServer 的 WAL (Write-Ahead Log) 的最新序列号。
+   *  这个值会和位置信息一起被记录在 hbase:meta 表中。
+   */
   private final long seqNum;
 
   public HRegionLocation(HRegionInfo regionInfo, ServerName serverName) {

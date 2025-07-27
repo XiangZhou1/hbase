@@ -88,8 +88,29 @@ class RegionMergeRequest implements Runnable {
 
       // If prepare does not return true, for some reason -- logged inside in
       // the prepare call -- we are not ready to merge just now. Just return.
+      /**
+       * ● 执行预准备 (mt.prepare(...)):
+       *   ○ 这是合并事务的第一步，进行各种先决条件检查，例如：
+       *     ■ 检查两个 Region 是否都存在且在线。
+       *     ■ 检查两个 Region 是否相邻 (region_a 的 endKey 是否等于 region_b 的 startKey)。
+       *     ■ 检查两个 Region 是否属于同一张表。
+       *     ■ 检查 RegionServer 是否正常运行。
+       *   ○ 如果 prepare() 返回 false，说明当前不满足合并条件，RegionMergeRequest 会直接返回，放弃本次合并。
+       */
       if (!mt.prepare(this.server)) return;
       try {
+        /**
+         *     ■ 在 HDFS 上为新的、合并后的 Region 创建一个临时目录。
+         *     ■ 关闭要被合并的两个源 Region (region_a 和 region_b)。这个过程会将它们各自的 MemStore 刷写（flush）到磁盘，生成新的 HFile。
+         *     ■ 将这两个源 Region 从 RegionServer 的在线服务列表中移除。
+         *     ■ 将两个源 Region 的所有 HFile 移动 (move) 到新的合并后 Region 的目录下。这是一个纯粹的 HDFS 文件系统元数据操作，速度非常快，不涉及数据拷贝。
+         *         ■ 在 hbase:meta 表中执行一个原子性的“CAS”（Compare-And-Swap）操作：
+         *       ● 将 region_a 和 region_b 的记录标记为“已合并”。
+         *       ● 同时，插入一条新的记录，代表合并后生成的新 Region。
+         *       ● 这同样是整个合并过程的**“不归点 (Point of No Return)”**。一旦 hbase:meta 表更新成功，合并就被认为是完成了。
+         *     ■ 将新的、合并后的 Region 上线，并向 Master 报告合并成功。
+         *
+         */
         mt.execute(this.server, this.server, this.user);
       } catch (Exception e) {
         if (this.server.isStopping() || this.server.isStopped()) {

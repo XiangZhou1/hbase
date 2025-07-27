@@ -54,6 +54,12 @@ import org.apache.hadoop.io.DataInputBuffer;
  * On a big cluster, each client will have thousands of instances of this object, often
  *  100 000 of them if not million. It's important to keep the object size as small
  *  as possible.
+ *
+ *  HRegionInfo 的主要作用是：
+ * ● 唯一标识一个 Region：通过表名、起始键和 Region ID 的组合，为每个 Region 生成一个唯一的 regionName。
+ * ● 定义 Region 的管辖范围：通过 startKey 和 endKey 字段，明确该 Region 负责存储的行键（Row Key）范围。这是一个左闭右开的区间 [startKey, endKey)。
+ * ● 记录 Region 的状态：通过 split 和 offLine 标志位，记录该 Region 是否已经分裂（成为父 Region）或是否已下线。
+ * ● 提供序列化能力：HRegionInfo 对象需要被持久化存储在 hbase:meta 表中，因此它必须能被序列化和反序列化。
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
@@ -174,6 +180,38 @@ public class HRegionInfo implements Comparable<HRegionInfo> {
     return encodedRegionName;
   }
 
+  /**
+   * HRegionInfo 类的核心信息都存储在它的成员变量中：
+   * ● private TableName tableName;
+   *   ○ 说明：该 Region 所属的表名。TableName 是一个封装了命名空间和表名的对象。
+   * ● private byte [] startKey;
+   *   ○ 说明：Region 的起始行键（Inclusive，包含）。一个表的第一个 Region 的 startKey 为空字节数组。
+   * ● private byte [] endKey;
+   *   ○ 说明：Region 的结束行键（Exclusive，不包含）。一个表的最后一个 Region 的 endKey 为空字节数组。
+   * ● private long regionId;
+   *   ○ 说明：Region 的唯一 ID。通常是 Region 创建时的时间戳，用于在 startKey 相同的情况下（例如，在 Region 分裂后，父 Region 和子 Region 可能有相同的 startKey）区分不同的 Region 实例。
+   * ● private byte [] regionName;
+   *   ○ 说明：Region 的全名，是根据 tableName, startKey 和 regionId 组合而成的唯一标识符。这个名字在整个 HBase 集群中是唯一的。
+   * ● private String encodedName;
+   *   ○ 说明：Region 的编码名称。这个名称主要用作该 Region 在 HDFS 上的目录名。它是一个对 regionName 进行哈希计算后得到的字符串，确保了在文件系统上是合法的目录名。
+   * ● private boolean split;
+   *   ○ 说明：一个标志位，表示该 Region 是否已经分裂。当一个 Region 分裂成两个子 Region 后，这个父 Region 的 split 标志会被设为 true。
+   * ● private boolean offLine;
+   *   ○ 说明：一个标志位，表示该 Region 是否处于下线状态。一个分裂了的父 Region 在其子 Region 还能被引用时，会保持 offLine 状态。
+   *
+   *
+   *
+   * Region 的名字 (regionName) 是其最重要的属性之一，它的格式直接影响系统的行为。HRegionInfo 中定义了两种命名格式：
+   * 新格式 (New Format)
+   * <tablename>,<startkey>,<regionIdTimestamp>.<encodedName>.
+   * ● <tablename>: 表名。
+   * ● <startkey>: 起始键。
+   * ● <regionIdTimestamp>: Region ID，通常是创建时间戳。
+   * ● <encodedName>: 对 "<tablename>,<startkey>,<regionIdTimestamp>" 这部分内容计算出的 MD5 哈希值的十六进制字符串。长度固定为32个字符。
+   * ● 分隔符: , 用于分隔主要部分，. 用于包裹 encodedName。
+   * 为什么需要 encodedName？
+   * 因为 startKey 中可能包含在 HDFS 文件系统中非法的字符。通过使用 MD5 哈希值作为目录名，可以保证目录名的合法性和唯一性。
+   */
   private byte [] endKey = HConstants.EMPTY_BYTE_ARRAY;
   // This flag is in the parent of a split while the parent is still referenced
   // by daughter regions.  We USED to set this flag when we disabled a table

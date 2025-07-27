@@ -195,16 +195,22 @@ public class RegionMergeTransaction {
    *         <code>false</code> if they are not (e.g. its already closed, etc.).
    */
   public boolean prepare(final RegionServerServices services) {
+    // 1. 检查两个 Region 是否属于同一张表。
     if (!region_a.getTableDesc().getTableName()
         .equals(region_b.getTableDesc().getTableName())) {
       LOG.info("Can't merge regions " + region_a + "," + region_b
           + " because they do not belong to the same table");
       return false;
     }
+
+    // 2. 检查是否在尝试合并同一个 Region。
     if (region_a.getRegionInfo().equals(region_b.getRegionInfo())) {
       LOG.info("Can't merge the same region " + region_a);
       return false;
     }
+
+    // 3. 检查邻接性。如果不是强制合并（forcible=false），则两个 Region 必须是相邻的。
+    //    相邻意味着 region_a 的 endKey 必须等于 region_b 的 startKey。
     if (!forcible && !HRegionInfo.areAdjacent(region_a.getRegionInfo(),
             region_b.getRegionInfo())) {
       String msg = "Skip merging " + this.region_a.getRegionNameAsString()
@@ -213,9 +219,13 @@ public class RegionMergeTransaction {
       LOG.info(msg);
       return false;
     }
+
+    // 4. 检查两个 Region 自身是否处于可合并状态。
+    //    例如，它们不能包含引用文件（即它们不能是刚分裂完还未合并数据的子 Region）。
     if (!this.region_a.isMergeable() || !this.region_b.isMergeable()) {
       return false;
     }
+    // 5. 检查 hbase:meta 表，确保这两个 Region 没有历史的合并标记，防止重复或冲突的合并。
     try {
       boolean regionAHasMergeQualifier = hasMergeQualifierInMeta(services,
           region_a.getRegionName());
@@ -239,7 +249,7 @@ public class RegionMergeTransaction {
     // the parent region to prevent the above case
     // Since HBASE-7721, we don't need fix up daughters any more. so here do
     // nothing
-
+    // 6. 计算并生成合并后新 Region 的元信息 (HRegionInfo)。
     this.mergedRegionInfo = getMergedRegionInfo(region_a.getRegionInfo(),
         region_b.getRegionInfo());
     return true;
@@ -353,6 +363,7 @@ public class RegionMergeTransaction {
     boolean testing = server == null ? true : server.getConfiguration()
         .getBoolean("hbase.testing.nocluster", false);
 
+    // 1. 执行所有在 PONR 之前的步骤，包括关闭源 Region 和移动 HFile。
     HRegion mergedRegion = stepsBeforePONR(server, services, testing);
 
     @MetaMutationAnnotation
@@ -394,6 +405,12 @@ public class RegionMergeTransaction {
     // This is the point of no return. Similar with SplitTransaction.
     // IF we reach the PONR then subsequent failures need to crash out this
     // regionserver
+
+    // ========================================================================
+    //                          不归点 (Point of No Return)
+    // ========================================================================
+    // 如果我们到达这里，事务就无法通过简单回滚来恢复了，必须通过崩溃 RegionServer 来恢复。
+    // 因为接下来的 hbase:meta 表编辑可能会超时，但实际上编辑成功了。
     this.journal.add(JournalEntry.PONR);
 
     // Add merged region and delete region_a and region_b
@@ -401,6 +418,9 @@ public class RegionMergeTransaction {
     // will determine whether the region is merged or not in case of failures.
     // If it is successful, master will roll-forward, if not, master will
     // rollback
+
+    // 2. 在 hbase:meta 表中原子地删除两个源 Region，并添加合并后的新 Region。
+    //    这个操作是合并成功的决定性标志。
     if (!testing && useZKForAssignment) {
       if (metaEntries.isEmpty()) {
         MetaEditor.mergeRegions(server.getCatalogTracker(), mergedRegion.getRegionInfo(), region_a
@@ -418,6 +438,7 @@ public class RegionMergeTransaction {
           + region_b.getRegionInfo().getRegionNameAsString());
       }
     }
+    // 3. 返回创建的合并后 Region 对象，以供后续步骤使用。
     return mergedRegion;
   }
 
@@ -463,8 +484,11 @@ public class RegionMergeTransaction {
       boolean testing) throws IOException {
     // Set ephemeral MERGING znode up in zk. Mocked servers sometimes don't
     // have zookeeper so don't do zk stuff if server or zookeeper is null
+    // 1. 在 ZooKeeper 中设置短时（ephemeral）的 MERGING 节点。
+    //    这是向 Master 宣告合并意图，用于分布式协调。
     if (useZKAndZKIsSet(server)) {
       try {
+        // 创建一个 PENDING_MERGE 状态的节点
         createNodeMerging(server.getZooKeeper(), this.mergedRegionInfo,
           server.getServerName(), region_a.getRegionInfo(), region_b.getRegionInfo());
       } catch (KeeperException e) {
@@ -480,16 +504,21 @@ public class RegionMergeTransaction {
       }
     }
     this.journal.add(JournalEntry.SET_MERGING_IN_ZK);
+
+    // 2. 等待 Master 确认合并请求，将 ZK 节点状态从 PENDING_MERGE 变为 MERGING。
     if (useZKAndZKIsSet(server)) {
       // After creating the merge node, wait for master to transition it
       // from PENDING_MERGE to MERGING so that we can move on. We want master
       // knows about it and won't transition any region which is merging.
       znodeVersion = getZKNode(server, services);
     }
-
+    // 3. 在 HDFS 上，在 region_a 的目录下创建一个名为 .merges 的临时目录。
+    //    所有合并操作的文件都将汇集于此。
     this.region_a.getRegionFileSystem().createMergesDir();
     this.journal.add(JournalEntry.CREATED_MERGE_DIR);
 
+    // 4. 依次关闭并下线两个源 Region。
+    //    close(false) 会刷写 MemStore 到磁盘，并返回该 Region 的所有 HFile。
     Map<byte[], List<StoreFile>> hstoreFilesOfRegionA = closeAndOfflineRegion(
         services, this.region_a, true, testing);
     Map<byte[], List<StoreFile>> hstoreFilesOfRegionB = closeAndOfflineRegion(
@@ -502,6 +531,9 @@ public class RegionMergeTransaction {
     // mergeStoreFiles creates merged region dirs under the region_a merges dir
     // Nothing to unroll here if failure -- clean up of CREATE_MERGE_DIR will
     // clean this up.
+    // 5. 合并 StoreFiles。这是合并操作高效的核心！
+    //    它不读取或重写数据，而是将 region_a 和 region_b 的所有 HFile **移动(move)** 到
+    //    之前创建的 .merges 临时目录下。
     mergeStoreFiles(hstoreFilesOfRegionA, hstoreFilesOfRegionB);
 
     if (server != null && useZKAndZKIsSet(server)) {
@@ -522,9 +554,11 @@ public class RegionMergeTransaction {
     // halfway through. If we do, we could have left
     // stuff in fs that needs cleanup -- a storefile or two. Thats why we
     // add entry to journal BEFORE rather than AFTER the change.
+    // 6. 记录日志，并基于 .merges 目录中的文件，创建合并后的新 Region 对象。
     this.journal.add(JournalEntry.STARTED_MERGED_REGION_CREATION);
     HRegion mergedRegion = createMergedRegionFromMerges(this.region_a,
         this.region_b, this.mergedRegionInfo);
+    // 7. 返回创建好的合并后 Region 对象。
     return mergedRegion;
   }
 

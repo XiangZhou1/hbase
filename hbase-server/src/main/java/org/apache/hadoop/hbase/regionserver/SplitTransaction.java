@@ -228,23 +228,46 @@ public class SplitTransaction {
    * <code>false</code> if it is not (e.g. its already closed, etc.).
    */
   public boolean prepare() {
+    // 检查可分裂性: 确认父 Region 当前的状态是可分裂的。
+    // 1. 检查父 Region 自身是否认为自己可分裂。
+    //    一个 Region 可能因为含有引用文件（表明它是一个分裂后的子 Region，但数据还未完全合并）而暂时不可分裂。
     if (!this.parent.isSplittable()) return false;
     // Split key can be null if this region is unsplittable; i.e. has refs.
+    // 检查分裂点: 确认 splitrow 是一个有效的分裂点，即它必须在父 Region 的 key 范围之内，且不等于 start key。
+    // 2. 检查分裂点（splitrow）是否有效。
+    //    如果 Region 不可分裂，其分裂点可能为 null。
     if (this.splitrow == null) return false;
+
+    // 3. 获取父 Region 的元信息（HRegionInfo），包括它的 startKey 和 endKey。
     HRegionInfo hri = this.parent.getRegionInfo();
+    //    通知父 Region 对象，准备要进行分裂了，可能会有一些内部状态调整。
     parent.prepareToSplit();
     // Check splitrow.
+    // 4. 再次校验分裂点 splitrow 的位置。
     byte [] startKey = hri.getStartKey();
     byte [] endKey = hri.getEndKey();
+
+    //    分裂点不能等于 Region 的 startKey，并且必须包含在 Region 的 [startKey, endKey) 范围内。
     if (Bytes.equals(startKey, splitrow) ||
         !this.parent.getRegionInfo().containsRow(splitrow)) {
       LOG.info("Split row is not inside region key range or is equal to " +
           "startkey: " + Bytes.toStringBinary(this.splitrow));
       return false;
     }
+
+    // 创建子 Region 信息: 根据 splitrow 计算出两个新的子 Region（Daughter A 和 B）的 HRegionInfo 对象。
+    // 这些对象定义了新 Region 的表名、key 范围等元信息。
+
+    // 5. 计算两个子 Region 的 ID（时间戳）。
+    //    这个 ID 必须大于或等于父 Region 的 ID，以确保在 hbase:meta 表中的排序正确。
     long rid = getDaughterRegionIdTimestamp(hri);
+
+    // 6. 基于父 Region 的表名、key 范围和新的 ID，创建两个子 Region 的 HRegionInfo 对象。
+    //    Daughter A: [parent.startKey, splitrow)
     this.hri_a = new HRegionInfo(hri.getTable(), startKey, this.splitrow, false, rid);
+    //    Daughter B: [splitrow, parent.endKey)
     this.hri_b = new HRegionInfo(hri.getTable(), this.splitrow, endKey, false, rid);
+    // 记录日志: 向 journal 添加 PREPARED 记录。
     this.journal.add(new JournalEntry(JournalEntryType.PREPARED));
     return true;
   }
@@ -300,6 +323,7 @@ public class SplitTransaction {
     // Coprocessor callback
     if (this.parent.getCoprocessorHost() != null) {
       if (user == null) {
+        //  调用协处理器的 preSplit 方法，给用户代码一个在分裂前执行逻辑的机会。
         // TODO: Remove one of these
         parent.getCoprocessorHost().preSplit();
         parent.getCoprocessorHost().preSplit(splitrow);
@@ -330,6 +354,7 @@ public class SplitTransaction {
         server.getConfiguration().getLong("hbase.regionserver.fileSplitTimeout",
           this.fileSplitTimeout);
 
+    // 执行所有在 PONR 之前的步骤，包括关闭父 Region 和创建引用文件
     PairOfSameType<HRegion> daughterRegions = stepsBeforePONR(server, services, testing);
 
     final List<Mutation> metaEntries = new ArrayList<Mutation>();
@@ -381,6 +406,15 @@ public class SplitTransaction {
     // OfflineParentInMeta timeout,this will cause regionserver exit,and then
     // master ServerShutdownHandler will fix daughter & avoid data loss. (See
     // HBase-4562).
+
+    // ========================================================================
+    //                          不归点 (Point of No Return)
+    // ========================================================================
+    // 如果我们到达这里，那么事务就无法通过简单回滚来恢复了，只能通过崩溃 RegionServer
+    // 来进行恢复。因为接下来的 hbase:meta 表编辑可能会超时，但实际上编辑成功了。
+    // 如果我们把 PONR 日志记录在修改 hbase:meta 之前，即使修改操作超时，
+    // 这也会导致 RegionServer 退出，然后 Master 的 ServerShutdownHandler 将修复
+    // 子 Region 的状态，避免数据丢失。(参见 HBase-4562)
     this.journal.add(new JournalEntry(JournalEntryType.PONR));
 
     // Edit parent in meta.  Offlines parent region and adds splita and splitb
@@ -388,6 +422,12 @@ public class SplitTransaction {
     // will determine whether the region is split or not in case of failures.
     // If it is successful, master will roll-forward, if not, master will rollback
     // and assign the parent region.
+
+    // 1. 在 hbase:meta 表中原子地修改父 Region，并添加两个子 Region 的信息。
+    //    这个操作是分裂成功的决定性标志。
+    //    - 将父 Region 标记为 offline=true, split=true。
+    //    - 在父 Region 行中添加 splitA 和 splitB 两列，指向两个子 Region。
+    //    - （新版本）插入两个子 Region 的新行。
     if (!testing && useZKForAssignment) {
       if (metaEntries == null || metaEntries.isEmpty()) {
         MetaEditor.splitRegion(server.getCatalogTracker(), parent.getRegionInfo(), daughterRegions
@@ -406,6 +446,7 @@ public class SplitTransaction {
             + parent.getRegionInfo().getRegionNameAsString());
       }
     }
+    // 2. 返回创建的两个子 Region 对象，以供后续步骤使用。
     return daughterRegions;
   }
 
@@ -413,8 +454,11 @@ public class SplitTransaction {
       final RegionServerServices services, boolean testing) throws IOException {
     // Set ephemeral SPLITTING znode up in zk.  Mocked servers sometimes don't
     // have zookeeper so don't do zk stuff if server or zookeeper is null
+    // 1. 在 ZooKeeper 中设置短时（ephemeral）的 SPLITTING 节点。
+    //    这是向 Master 宣告分裂意图的第一步，用于分布式协调。
     if (server != null && server.getZooKeeper() != null && useZKForAssignment) {
       try {
+        // 创建一个 PENDING_SPLIT 状态的节点
         createNodeSplitting(server.getZooKeeper(),
           parent.getRegionInfo(), server.getServerName(), hri_a, hri_b);
       } catch (KeeperException e) {
@@ -428,7 +472,12 @@ public class SplitTransaction {
             + parent.getRegionNameAsString());
       }
     }
+    // 记录日志：已在 ZK 中设置分裂状态
     this.journal.add(new JournalEntry(JournalEntryType.SET_SPLITTING_IN_ZK));
+
+    // 2. 等待 Master 确认分裂请求。
+    //    Master 会将 ZK 节点从 PENDING_SPLIT 状态变为 SPLITTING 状态。
+    //    这是一个重要的同步点，确保 Master 已知晓并同意此次分裂。
     if (server != null && server.getZooKeeper() != null && useZKForAssignment) {
       // After creating the split node, wait for master to transition it
       // from PENDING_SPLIT to SPLITTING so that we can move on. We want master
@@ -436,7 +485,10 @@ public class SplitTransaction {
       znodeVersion = getZKNode(server, services);
     }
 
+    // 3. 在 HDFS 上，父 Region 目录下创建一个名为 .splits 的临时目录。
+    //    所有分裂过程中的临时文件都将放在这里。
     this.parent.getRegionFileSystem().createSplitsDir();
+    // 记录日志：已创建分裂目录
     this.journal.add(new JournalEntry(JournalEntryType.CREATE_SPLIT_DIR));
 
     Map<byte[], List<StoreFile>> hstoreFilesToSplit = null;
@@ -461,6 +513,9 @@ public class SplitTransaction {
       if (exceptionToThrow instanceof IOException) throw (IOException)exceptionToThrow;
       throw new IOException(exceptionToThrow);
     }
+
+    // 5. 将父 Region 从 RegionServer 的在线服务列表中移除。
+    //    从此，该 RegionServer 不再对外提供此 Region 的读写服务。
     if (!testing) {
       services.removeFromOnlineRegions(this.parent, null);
     }
@@ -472,23 +527,38 @@ public class SplitTransaction {
     // splitStoreFiles creates daughter region dirs under the parent splits dir
     // Nothing to unroll here if failure -- clean up of CREATE_SPLIT_DIR will
     // clean this up.
+    /**
+     *   ○ 调用 splitStoreFiles()。这一步并不会复制数据。相反，它会遍历父 Region 的所有 HFile，为每一个 HFile 创建两个小的**“引用文件 (reference file)”**，
+     *          一个指向 HFile 的前半部分数据（属于 Daughter A），另一个指向后半部分（属于 Daughter B）。
+     *   ○ 这些引用文件被分别放在 .splits 目录下的两个子目录里。
+     */
+    // 6. 分裂 HFile，创建引用文件（Reference Files）。
+    //    这是 HBase 分裂高效的核心！它不拷贝数据，只是创建指向原 HFile 特定范围的小文件。
+    //    这个过程是并发执行的，以提高效率。
     Pair<Integer, Integer> expectedReferences = splitStoreFiles(hstoreFilesToSplit);
 
     // Log to the journal that we are creating region A, the first daughter
     // region.  We could fail halfway through.  If we do, we could have left
     // stuff in fs that needs cleanup -- a storefile or two.  Thats why we
     // add entry to journal BEFORE rather than AFTER the change.
+    // 7. 基于引用文件，在 HDFS 上创建两个子 Region 的物理目录和文件结构。
+    //    并实例化两个 HRegion 对象。
+
+    // 记录日志：开始创建子 Region A
     this.journal.add(new JournalEntry(JournalEntryType.STARTED_REGION_A_CREATION));
     assertReferenceFileCount(expectedReferences.getFirst(),
         this.parent.getRegionFileSystem().getSplitsDir(this.hri_a));
+    // 从 .splits 临时目录中的引用文件创建 Daughter A 的 HRegion 对象
     HRegion a = this.parent.createDaughterRegionFromSplits(this.hri_a);
     assertReferenceFileCount(expectedReferences.getFirst(),
         new Path(this.parent.getRegionFileSystem().getTableDir(), this.hri_a.getEncodedName()));
 
     // Ditto
+    // 记录日志：开始创建子 Region B
     this.journal.add(new JournalEntry(JournalEntryType.STARTED_REGION_B_CREATION));
     assertReferenceFileCount(expectedReferences.getSecond(),
         this.parent.getRegionFileSystem().getSplitsDir(this.hri_b));
+    // 从 .splits 临时目录中的引用文件创建 Daughter B 的 HRegion 对象
     HRegion b = this.parent.createDaughterRegionFromSplits(this.hri_b);
     assertReferenceFileCount(expectedReferences.getSecond(),
         new Path(this.parent.getRegionFileSystem().getTableDir(), this.hri_b.getEncodedName()));

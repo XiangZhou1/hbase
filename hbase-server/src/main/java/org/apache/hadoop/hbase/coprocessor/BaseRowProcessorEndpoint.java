@@ -43,6 +43,10 @@ import com.google.protobuf.Service;
 /**
  * This class demonstrates how to implement atomic read-modify-writes
  * using {@link HRegion#processRowsWithLocks} and Coprocessor endpoints.
+ *
+ * BaseRowProcessorEndpoint 是一个**协处理器端点（Coprocessor Endpoint）**的基类。Endpoint 是一种特殊的协处理器，它允许你为 HBase 表定义全新的 RPC 接口，从而实现自定义的、服务器端的计算逻辑。
+ * 这个基类的核心目的，是提供一个标准化的框架来执行原子的“读-修改-写”（Read-Modify-Write）操作，特别是当这个操作需要跨越多行时。
+ * 在 HBase 中，单行的操作（如 checkAndPut）是原子的，因为 HBase 会对单行加锁。但是，如果你需要读取三行数据，根据它们的值计算出一个结果，然后再去更新另外两行，并保证整个过程不被其他操作干扰，这就非常困难了。BaseRowProcessorEndpoint 正是为了解决这个问题而设计的。
  */
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.COPROC)
 @InterfaceStability.Evolving
