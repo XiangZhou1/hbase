@@ -103,6 +103,25 @@ public class ExplicitColumnTracker implements ColumnTracker {
 
   /**
    * {@inheritDoc}
+   *
+   * 当 ScanQueryMatcher 拿到一个 KeyValue (单元格) 时，它首先会调用 checkColumn 来判断这个 KeyValue 的列是否是当前需要寻找的列。
+   * checkColumn 的内部逻辑是一个 do-while(true) 循环，非常精巧：
+   * ● 检查清单是否完成: 如果 index 已经超出了 columns 数组的范围 (done())，说明清单上所有的商品都已找完。直接返回 SEEK_NEXT_ROW，告诉 ScanQueryMatcher：“这一行没东西可找了，直接跳到下一行吧。”
+   * ● 比较当前商品: 将传入的 KeyValue 的列限定符与 this.column（当前正在寻找的目标列）进行字节比较。
+   * ● 比较结果有三种情况:
+   *   ○ 等于 0 (匹配成功):
+   *     ■ 太棒了！找到了清单上正在寻找的商品。
+   *     ■ 返回 MatchCode.INCLUDE。这个返回值只是一个临时许可，意思是“列是对的，但数量（版本）够不够，我还没看”。ScanQueryMatcher 收到后，会紧接着调用 checkVersions 方法来做最终判断。
+   *   ○ 大于 0 (当前商品“太小了”):
+   *     ■ 这意味着 KeyValue 的列在字典序上小于我们正在寻找的 this.column。例如，我们正在找 "name"，但传进来的是 "age"。
+   *     ■ 这说明我们需要跳过当前这个 KeyValue，继续寻找 "name"。
+   *     ■ 返回 MatchCode.SEEK_NEXT_COL。这个 MatchCode 是一个强烈的指令，告诉上层扫描器（StoreScanner）：
+   *              “你不用再一个一个地给我 KeyValue 了，请直接用 HFile 的索引**跳跃（seek）**到我们目标列 this.column 的位置。” 这是一个关键的性能优化。
+   *   ○ 小于 0 (当前商品“太大了”):
+   *     ■ 这意味着 KeyValue 的列在字典序上大于我们正在寻找的 this.column。例如，我们正在找 "age"，但传进来的是 "name"。
+   *     ■ 因为 KeyValue 是有序的，这说明我们永远也找不到 "age" 了（已经错过了）。
+   *     ■ 采购员的动作: 在清单上划掉 "age" 这一项，将指针 index 加 1，更新 this.column 为清单上的下一个商品（比如 "phone"）。
+   *     ■ 然后，continue 循环，用这个新的目标列 "phone" 与刚刚传进来的 "name" 再次进行比较。这个递归式的比较会一直进行，直到找到匹配的列，或者发现当前 KeyValue 比所有待找的列都小。
    */
   @Override
   public ScanQueryMatcher.MatchCode checkColumn(byte [] bytes, int offset,
@@ -155,6 +174,20 @@ public class ExplicitColumnTracker implements ColumnTracker {
     } while(true);
   }
 
+    /**
+     * ● 去重: 首先检查传入的 KeyValue 的时间戳是否与上一个被接受的同列 KeyValue 的时间戳相同。如果是，说明是重复数据，直接返回 SKIP。
+     * ● 计数与版本检查:
+     *   ○ 将当前列的 count 加 1。
+     *   ○ 检查 count 是否已经达到了 maxVersions 的上限。
+     *   ○ 如果达到了上限：
+     *     ■ 这意味着这个商品（列）我们已经拿够了。
+     *     ■ 在清单上划掉这一项（index 加 1），并更新 this.column 指向下一个目标列。
+     *     ■ 返回 MatchCode.INCLUDE_AND_SEEK_NEXT_COL。这个复合指令的意思是：“收下当前这个 KeyValue，但这个商品我已经拿够了，请直接跳到我清单上的下一个商品。”
+     *     ■ 如果划掉后，清单上所有商品都已找完 (done())，则返回 INCLUDE_AND_SEEK_NEXT_ROW，意思是：“收下当前这个 KeyValue，并且我的任务都完成了，请直接跳到下一行。”
+     * ● 未达到上限:
+     *   ○ 如果版本数还没满，就记录下当前 KeyValue 的时间戳（用于下次去重），并返回 MatchCode.INCLUDE。
+     * @throws IOException
+     */
   @Override
   public ScanQueryMatcher.MatchCode checkVersions(byte[] bytes, int offset, int length,
       long timestamp, byte type, boolean ignoreCount) throws IOException {

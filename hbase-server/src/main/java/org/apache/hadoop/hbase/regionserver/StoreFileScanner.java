@@ -45,6 +45,11 @@ public class StoreFileScanner implements KeyValueScanner {
   static final Log LOG = LogFactory.getLog(HStore.class);
 
   // the reader it comes from:
+  /**
+   * ● StoreFile.Reader reader:
+   *   ○ 持有其所属 StoreFile 的 Reader 对象的引用。
+   *   ○ 通过这个 reader，它可以访问到 HFile 的元数据，如布隆过滤器、序列号、时间范围等。
+   */
   private final StoreFile.Reader reader;
   private final HFileScanner hfs;
   private KeyValue cur = null;
@@ -151,6 +156,17 @@ public class StoreFileScanner implements KeyValueScanner {
     return cur;
   }
 
+  /**
+   * ● 作用: 将扫描器的指针向前移动一个位置。
+   * ● 执行流程:
+   *   ○ 保存当前值: KeyValue retKey = cur，先保存当前指针指向的 KeyValue，因为 next() 方法需要返回被“越过”的那个值。
+   *   ○ 委托给 HFileScanner: 调用 hfs.next()，移动物理指针。
+   *   ○ 更新当前指针: cur = hfs.getKeyValue()。
+   *   ○ 执行 MVCC 过滤: 再次调用 skipKVsNewerThanReadpoint()，确保新的 cur 也符合 MVCC 的要求。
+   *   ○ 返回: 返回之前保存的 retKey。
+   * @return
+   * @throws IOException
+   */
   public KeyValue next() throws IOException {
     KeyValue retKey = cur;
 
@@ -321,6 +337,14 @@ public class StoreFileScanner implements KeyValueScanner {
    * to do a real seek in cases when the seek timestamp is older than the
    * highest timestamp of the file, e.g. when we are trying to seek to the next
    * row/column and use OLDEST_TIMESTAMP in the seek key.
+   *
+   * 这是 StoreFileScanner 中一个非常精妙的性能优化。
+   * ● 核心思想: 在很多情况下，尤其是当 StoreScanner 扫描多个 HFile 时，一个较旧的 HFile 可能根本就不包含用户需要的数据。如果我们为每个 HFile 都立即执行一次昂贵的物理 seek 操作，会浪费大量 I/O。Lazy Seek 的思想是：“先假装 seek 成功了，但实际上什么都不做，直到我真的需要从你这里拿数据时，再执行真正的 seek。”
+   * ● 执行流程:
+   *   ○ 布隆过滤器检查: 首先利用 reader 的布隆过滤器进行快速检查。如果布隆过滤器明确告知 kv 不可能存在于这个 HFile 中，requestSeek 会创建一个“伪造的” KeyValue (kv.createLastOnRowCol()) 作为 cur。这个伪造的 KeyValue 非常大，可以确保这个 StoreFileScanner 在 KeyValueHeap 中会沉到底部，在很长一段时间内都不会被访问到，从而避免了无效的 seek。
+   *   ○ 设置延迟标记: 如果布隆过滤器无法排除，requestSeek 会设置 delayedReseek = true 和 delayedSeekKV = kv，记录下“有一个 seek 请求被延迟了”。
+   *   ○ 创建伪造 cur: 它会创建一个伪造的 cur，其时间戳是该 HFile 中可能存在的最大时间戳。这同样是为了让它在 KeyValueHeap 中暂时沉底。
+   *   ○ 不执行物理 Seek: 最关键的是，它不会调用 hfs.seek()。
    */
   @Override
   public boolean requestSeek(KeyValue kv, boolean forward, boolean useBloom)

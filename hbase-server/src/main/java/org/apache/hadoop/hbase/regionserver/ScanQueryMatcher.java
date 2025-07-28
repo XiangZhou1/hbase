@@ -40,6 +40,17 @@ import com.google.common.base.Preconditions;
 
 /**
  * A query matcher that is specifically designed for the scan case.
+ * ScanQueryMatcher 的核心作用是：对于给定的一个 KeyValue，根据 Scan 请求的所有条件，判断应该如何处理这个 KeyValue。
+ * ● 决策中心: 它是 StoreScanner 内部的决策核心。StoreScanner 从 KeyValueHeap 中取出每一个 KeyValue 后，都会立即将其交给 ScanQueryMatcher 的 match() 方法来“审判”。
+ * ● 条件封装器: 它在构造时，会从 Scan 对象和 ScanInfo（列族 schema）中提取并封装所有相关的查询条件，包括：
+ *   ○ 行键范围 (startRow, stopRow)
+ *   ○ 时间范围 (TimeRange)
+ *   ○ 版本数 (maxVersions)
+ *   ○ 过滤器 (Filter)
+ *   ○ 列选择（通过 ColumnTracker 实现）
+ *   ○ 删除标记的处理逻辑（DeleteTracker）
+ * ● 状态机: ScanQueryMatcher 是有状态的。它会记住当前正在处理的行 (row)，以及在该行内已经匹配到的列和版本。这使得它能够做出诸如“这个版本太多了，跳过”、“这一列已经满足条件，请 seek 到下一列”等复杂的决策。
+ * ● 指令发出者: 它的 match() 方法的返回值是一个 MatchCode 枚举。这个 MatchCode 就是它给 StoreScanner 的明确指令，告诉 StoreScanner 下一步是应该包含当前 KeyValue、跳过它，还是高效地 seek 到下一个感兴趣的位置。
  */
 @InterfaceAudience.Private
 public class ScanQueryMatcher {
@@ -52,7 +63,12 @@ public class ScanQueryMatcher {
 
   private final Filter filter;
 
-  /** Keeps track of deletes */
+  /** Keeps track of deletes
+   * ● DeleteTracker:
+   *   ○ 职责: 负责跟踪和应用删除标记。
+   *   ○ 工作方式: 当 ScanQueryMatcher 遇到一个删除标记（如 DeleteColumn, DeleteFamily）时，会将其添加到 DeleteTracker 中。之后，对于遇到的每一个 Put 类型的 KeyValue，都会先询问 DeleteTracker：“这个 KeyValue 是否已经被删除了？” DeleteTracker 会根据其内部记录的删除标记的时间戳来做出判断。
+   *   ○ 实现: ScanDeleteTracker 是其默认实现。
+   * */
   private final DeleteTracker deletes;
 
   /*
@@ -77,7 +93,13 @@ public class ScanQueryMatcher {
   private final boolean seePastDeleteMarkers;
 
 
-  /** Keeps track of columns and versions */
+  /** Keeps track of columns and versions
+   *   ○ 职责: 负责处理所有与列和版本相关的匹配逻辑。
+   *   ○ 工作方式: 它会跟踪 Scan 请求中需要哪些列。对于每个 KeyValue，它会检查其列是否在请求范围内。更重要的是，它会为每个匹配的列维护一个版本计数器，根据 maxVersions 的设置，判断当前 KeyValue 的版本是否应该被包含。
+   *   ○ 两种实现:
+   *     ■ ScanWildcardColumnTracker: 用于处理扫描整个列族（scan.addFamily()）的情况。
+   *     ■ ExplicitColumnTracker: 用于处理只扫描指定列（scan.addColumn()）的情况，性能更高。
+   * */
   private final ColumnTracker columns;
 
   /** Key to seek to in memstore and StoreFiles */
@@ -287,6 +309,13 @@ public class ScanQueryMatcher {
     short rowLength = Bytes.toShort(bytes, offset, Bytes.SIZEOF_SHORT);
     offset += Bytes.SIZEOF_SHORT;
 
+    /**
+     * ● 行范围检查 (Row Range Check):
+     *   ○ 首先，比较当前 kv 的行键与 matcher 内部记录的当前行 (this.row)。
+     *   ○ 如果 kv 的行键小于当前行（在反向扫描中是大于），说明扫描器可能需要重新 seek，返回 SEEK_NEXT_ROW。
+     *   ○ 如果 kv 的行键大于当前行（在反向扫描中是小于），说明当前行已经处理完毕，返回 DONE，StoreScanner 会开始处理新行。
+     *   ○ 如果行键匹配，则继续。
+     */
     int ret = this.rowComparator.compareRows(row, this.rowOffset, this.rowLength,
         bytes, offset, rowLength);
     if (!this.isReversed) {
@@ -307,15 +336,23 @@ public class ScanQueryMatcher {
     }
 
     // optimize case.
+    // --- 3. 行级优化检查 ---
+    // stickyNextRow 是一个状态标志。一旦被设为 true，意味着 matcher 已经判定当前行的剩余部分都不需要了。
+    // 比如 Filter 返回了 NEXT_ROW，或者所有请求的列的版本都已找够。
+    // 这个检查可以避免对同一行内后续的 KV 进行不必要的复杂判断。
     if (this.stickyNextRow)
         return MatchCode.SEEK_NEXT_ROW;
 
+    // 如果 ColumnTracker 报告说所有需要的列都已经找到了足够的版本，
+    // 那么当前行的后续 KV 也不再需要。设置 stickyNextRow 并返回 SEEK_NEXT_ROW。
     if (this.columns.done()) {
       stickyNextRow = true;
       return MatchCode.SEEK_NEXT_ROW;
     }
 
     //Passing rowLength
+    // --- 4. 单元格级别解析与优化 ---
+    // 继续解析 KV 的剩余部分。
     offset += rowLength;
 
     //Skipping family
@@ -327,11 +364,14 @@ public class ScanQueryMatcher {
 
     long timestamp = Bytes.toLong(bytes, initialOffset + keyLength - KeyValue.TIMESTAMP_TYPE_SIZE);
     // check for early out based on timestamp alone
+    // 基于时间戳的优化：如果当前 KV 的时间戳比 ColumnTracker 记录的“最旧需要的时间戳”还要旧，
+    // 那么它和它之后的（时间戳更旧的）KV 都不可能满足版本要求，可以直接 seek 到下一列或下一行。
     if (columns.isDone(timestamp)) {
       return columns.getNextRowOrNextColumn(kv.getQualifierArray(), kv.getQualifierOffset(),
         kv.getQualifierLength());
     }
     // check if the cell is expired by cell TTL
+    // 基于 TTL 的检查：如果该单元格因为 TTL 过期了，直接跳过。
     if (HStore.isCellTTLExpired(kv, this.oldestUnexpiredTS, this.now)) {
       return MatchCode.SKIP;
     }    
@@ -349,6 +389,9 @@ public class ScanQueryMatcher {
      * 7. Delete marker need to be version counted together with puts
      *    they affect
      */
+
+    // --- 5. 删除标记处理 ---
+    // 这是 match 方法中最复杂的部分，处理逻辑依赖于多种配置。
     byte type = bytes[initialOffset + keyLength - 1];
     if (kv.isDelete()) {
       if (keepDeletedCells == KeepDeletedCells.FALSE
@@ -368,7 +411,7 @@ public class ScanQueryMatcher {
         }
         // Can't early out now, because DelFam come before any other keys
       }
-     
+
       if ((!isUserScan)
           && timeToPurgeDeletes > 0
           && (EnvironmentEdgeManager.currentTimeMillis() - timestamp) <= timeToPurgeDeletes) {
@@ -420,6 +463,10 @@ public class ScanQueryMatcher {
     // fails, reports lost big or tiny families" for a horror story. Check here for
     // OLDEST_TIMESTAMP. TimeRange#compare is about more generic timestamps, between 0L and
     // Long.MAX_LONG. It doesn't do OLDEST_TIMESTAMP weird handling.
+
+    // --- 6. 时间范围检查 ---
+    // HConstants.OLDEST_TIMESTAMP 是一个特殊的标记值，用于构造 seek key (如 LastOnRow)，
+    // 这种伪造的 Cell 绝不能返回给客户端。这里做一个特殊检查，将其视为不在任何时间范围内。
     int timestampComparison = timestamp == HConstants.OLDEST_TIMESTAMP? -1: tr.compare(timestamp);
     if (timestampComparison >= 1) {
       return MatchCode.SKIP;
@@ -428,6 +475,9 @@ public class ScanQueryMatcher {
     }
 
     // STEP 1: Check if the column is part of the requested columns
+    // --- 7. 核心匹配流程 (四步法) ---
+    // 步骤 1: 检查列是否匹配 (Check if the column is part of the requested columns)
+    // `columns` (ColumnTracker) 会判断当前 KV 的列是否是 Scan 请求的列之一。
     MatchCode colChecker = columns.checkColumn(bytes, offset, qualLength, type);
     if (colChecker == MatchCode.INCLUDE) {
       ReturnCode filterResponse = ReturnCode.SKIP;

@@ -68,16 +68,22 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   protected boolean closing = false;
   protected final boolean isGet;
   protected final boolean explicitColumnQuery;
+  // 判断是否应该使用行-列组合的布隆过滤器。
   protected final boolean useRowColBloom;
   /**
    * A flag that enables StoreFileScanner parallel-seeking
+   * 根据配置和 StoreFile 数量，判断是否启用并行 seek 优化。
    */
   protected boolean isParallelSeekEnabled = false;
   protected ExecutorService executor;
+  // 保存客户端传来的 Scan 对象。
   protected final Scan scan;
+  // 保存明确指定的列集合（如果存在）。
   protected final NavigableSet<byte[]> columns;
+  // 根据 scanInfo 中的 TTL (Time-To-Live) 计算出最老的不被视为过期的时间戳。
   protected final long oldestUnexpiredTS;
   protected final long now;
+  // 从 scanInfo 获取最小版本数。
   protected final int minVersions;
 
   /**
@@ -111,7 +117,9 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     AFTER_SEEK,
     COMPACT_COMPLETE
   }
-  
+  /**
+   *
+   */
   /** An internal constructor. */
   protected StoreScanner(Store store, boolean cacheBlocks, Scan scan,
       final NavigableSet<byte[]> columns, long ttl, int minVersions, long readPt) {
@@ -157,7 +165,16 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   /**
    * Opens a scanner across memstore, snapshot, and all StoreFiles. Assumes we
    * are not in a compaction.
-   *
+   * StoreScanner 的核心作用是为单个 HStore（列族）提供一个统一的、有序的 KeyValue 扫描视图。
+   * ● 列族级别的扫描器: 每个 StoreScanner 只负责一个列族的数据。一个 Scan 操作如果涉及多个列族，RegionScanner 就会为每个列族创建一个 StoreScanner。
+   * ● 数据源的聚合者: 它的主要任务是聚合来自两个不同来源的数据流：
+   *   ○ 内存数据: 来自 MemStore（包括当前的 active MemStore 和 flush 过程中的 snapshot）。
+   *   ○ 磁盘数据: 来自该 HStore 下的所有 HFile（StoreFile）。
+   * ● 数据净化器: 在向上层（RegionScanner）提供数据之前，StoreScanner 会执行关键的数据净化工作，这是保证数据正确性的核心环节：
+   *   ○ 版本管理: 根据列族 schema 中定义的 maxVersions，过滤掉多余的旧版本。
+   *   ○ TTL (Time-To-Live) 清理: 过滤掉时间戳已经超过存活时间的数据。
+   *   ○ 删除标记处理: 识别并处理各种删除标记（Delete, DeleteColumn, DeleteFamily），确保已被删除的数据不会返回给用户。
+   * ● 查询匹配与过滤: 它内部持有一个 ScanQueryMatcher 对象，这个对象封装了所有与 Scan 请求相关的匹配逻辑和过滤器（Filter），在遍历过程中实时判断每个 KeyValue 是否应该被包含、跳过，或者是否应该直接 seek 到下一行/下一列。
    * @param store who we scan
    * @param scan the spec
    * @param columns which columns we are scanning
@@ -172,13 +189,33 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       throw new DoNotRetryIOException(
           "Cannot specify any column for a raw scan");
     }
+    /**
+     *   ○ 将 scan 对象、scanInfo（来自 Store 的 schema 信息）、columns 集合等所有与查询相关的规则全部传递给 ScanQueryMatcher 的构造函数。
+     *   ○ ScanQueryMatcher 内部会根据这些信息初始化好 TimeRange, Filter, ColumnTracker, DeleteTracker 等所有子组件。
+     *   ○ 从这一刻起，所有关于一个 KeyValue 是否应该被包含、跳过或 seek 的决策，都将由这个 matcher 对象负责。
+     */
     matcher = new ScanQueryMatcher(scan, scanInfo, columns,
         ScanType.USER_SCAN, Long.MAX_VALUE, HConstants.LATEST_TIMESTAMP,
         oldestUnexpiredTS, now, store.getCoprocessorHost());
 
+    /**
+     * ● 目的: 实现对底层 HFile 变化的动态感知。
+     * ● 动作: StoreScanner 实现了 ChangedReadersObserver 接口。通过将自己注册到 store 的观察者列表中，
+     *     它就能在 store 发生 Compaction 或 Flush 时，接收到 updateReaders() 的回调通知。
+     *     这保证了扫描器能够及时更新其内部的 HFile 扫描器列表，避免读取到已经失效的文件。
+     */
     this.store.addChangedReaderObserver(this);
 
     try {
+      /**
+       * ● 目的: 收集本次扫描需要用到的所有数据源的扫描器。
+       * ● 动作:
+       *   ○ 调用 getScannersNoCompaction() 方法。
+       *   ○ 该方法内部会调用 store.getScanners(...)，这个调用会返回：
+       *     ■ MemStore 的扫描器: 一个或多个，包括 active MemStore 和可能存在的 snapshot。
+       *     ■ 所有 HFile 的扫描器: 为该 Store 下的每一个 HFile 创建一个 StoreFileScanner。
+       *   ○ getScannersNoCompaction 还会对返回的扫描器列表进行预筛选，根据时间范围、TTL、布隆过滤器等条件，提前排除掉那些完全不可能包含所需数据的 HFile，这是一个重要的 I/O 优化。
+       */
       // Pass columns to try to filter out unnecessary StoreFiles.
       List<KeyValueScanner> scanners = getScannersNoCompaction();
 
@@ -186,6 +223,14 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       // key does not exist, then to the start of the next matching Row).
       // Always check bloom filter to optimize the top row seek for delete
       // family marker.
+      /**
+       * ● 目的: 将所有扫描器的“指针”定位到扫描的起始位置。
+       * ● 动作:
+       *   ○ matcher.getStartKey(): 从 ScanQueryMatcher 获取本次扫描的起始 KeyValue。这通常是根据 scan.getStartRow() 构建的一个虚拟 KeyValue。
+       *   ○ seekScanners 方法会遍历 scanners 列表，对每一个 KeyValueScanner 调用 seek() 或 requestSeek() (用于懒加载 lazy seek)。
+       *   ○ 如果开启了 isParallelSeekEnabled，这个 seek 操作会在一个线程池中并行执行，以减少 I/O 等待时间。
+       *   ○ seek 完成后，每个底层扫描器的内部指针都已经指向了大于或等于 startKey 的第一个位置。
+       */
       seekScanners(scanners, matcher.getStartKey(), explicitColumnQuery && lazySeekEnabledGlobally,
         isParallelSeekEnabled);
 
@@ -196,6 +241,13 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       this.storeOffset = scan.getRowOffsetPerColumnFamily();
 
       // Combine all seeked scanners with a heap
+      /**
+       * ● 目的: 将所有已经 seek 好的底层扫描器整合成一个统一的、有序的视图。
+       * ● 动作:
+       *   ○ 调用 resetKVHeap，其内部会 new KeyValueHeap(scanners, ...)。
+       *   ○ KeyValueHeap 的构造函数会分别调用每个底层扫描器的 peek() 方法，获取它们的第一个 KeyValue，并将这些 KeyValue 放入一个最小堆中。
+       *   ○ 构造完成后，heap.peek() 就能立即返回所有数据源中全局排序最靠前的那个 KeyValue。StoreScanner 的准备工作至此全部完成。
+       */
       resetKVHeap(scanners, store.getComparator());
     } catch (IOException e) {
       // remove us from the HStore#changedReaderObservers here or we'll have no chance to
@@ -444,6 +496,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   public boolean next(List<Cell> outResult, int limit) throws IOException {
     lock.lock();
     try {
+
+    //调用 checkReseek()，检查是否因为后台 Compaction 导致需要重建 Scanner 栈。
+      //   如果需要，checkReseek 会完成重建，并返回 true，此时 next 方法也直接返回 true，
+      //   提示上层（RegionScanner）重新 peek 并开始新一轮的 next 调用。
     if (checkReseek()) {
       return true;
     }
@@ -455,6 +511,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       return false;
     }
 
+    /**
+     *   ○ 检查 heap 是否为 null。如果为 null，说明扫描已结束，关闭并返回 false。
+     *   ○ kv = this.heap.peek(): 从 KeyValueHeap 的堆顶窥视（不移除）当前全局最小的 KeyValue。
+     */
     KeyValue kv = this.heap.peek();
     if (kv == null) {
       close();
@@ -481,7 +541,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       if (prevKV != kv) ++kvsScanned; // Do object compare - we set prevKV from the same heap.
       checkScanOrder(prevKV, kv, comparator);
       prevKV = kv;
-
+      /**
+       *   matcher.match(kv): 将当前 kv 交给 ScanQueryMatcher 进行匹配。
+       *   这是决策的核心，matcher 会综合考虑行范围、列、时间范围、版本数以及所有 Filter 的逻辑，返回一个 MatchCode。
+       */
       ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
       qcode = optimize(qcode, kv);
       switch(qcode) {
@@ -489,6 +552,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
         case INCLUDE_AND_SEEK_NEXT_ROW:
         case INCLUDE_AND_SEEK_NEXT_COL:
 
+          // 允许 Filter 对即将返回的 Cell 进行最终转换。
           Filter f = matcher.getFilter();
           if (f != null) {
             // TODO convert Scan Query Matcher to be Cell instead of KV based ?
@@ -496,23 +560,28 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
           }
 
           this.countPerRow++;
+          // 检查是否超过了单列族内返回结果数量的限制 (用于行内分页)。
           if (storeLimit > -1 &&
               this.countPerRow > (storeLimit + storeOffset)) {
             // do what SEEK_NEXT_ROW does.
             if (!matcher.moreRowsMayExistAfter(kv)) {
               return false;
             }
+            // 如果超过，则直接 seek 到下一行。
             seekToNextRow(kv);
             break LOOP;
           }
 
           // add to results only if we have skipped #storeOffset kvs
           // also update metric accordingly
+
+          // 如果已经跳过了指定的 offset，则将 kv 加入结果列表。
           if (this.countPerRow > storeOffset) {
             outResult.add(kv);
             count++;
           }
 
+          // 根据具体的指令，决定是 seek 到下一行/下一列，还是简单地 next()
           if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW) {
             if (!matcher.moreRowsMayExistAfter(kv)) {
               return false;
@@ -523,7 +592,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
           } else {
             this.heap.next();
           }
-
+          // 如果达到了本次 next() 调用的数量限制，则跳出循环。
           if (limit > 0 && (count == limit)) {
             break LOOP;
           }

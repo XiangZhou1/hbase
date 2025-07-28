@@ -3320,12 +3320,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         if (region.getCoprocessorHost() != null) {
           scanner = region.getCoprocessorHost().preScannerOpen(scan);
         }
+        /**
+         *   ○ HRegion 内部会为这个 scan 请求创建一个层级化的扫描器（RegionScanner）：
+         *     ■ 顶层: 一个 RegionScanner 实例。
+         *     ■ 中层: 为 Scan 中涉及的每个列族（HStore）创建一个 StoreScanner。
+         *     ■ 底层: 每个 StoreScanner 内部，又会为该列族的 MemStore 和所有 HFile 文件分别创建更底层的 KeyValueScanner。
+         *   ○ 这些底层的扫描器最终会被一个最小堆 (KeyValueHeap) 组织起来，这个堆能高效地实现多路归并排序，确保总是能拿到全局排序最靠前的下一个单元格。
+         */
         if (scanner == null) {
           scanner = region.getScanner(scan);
         }
         if (region.getCoprocessorHost() != null) {
           scanner = region.getCoprocessorHost().postScannerOpen(scan, scanner);
         }
+        //   服务器内部有一个 scanners 映射表（ConcurrentHashMap），
+        //   它会以 scannerId 为键，将刚刚创建的 RegionScanner 和其所属的 HRegion
+        //   包装在一个 RegionScannerHolder 对象中，存入此映射表。
         scannerId = addScanner(scanner, region);
         scannerName = String.valueOf(scannerId);
         ttl = this.scannerLeaseTimeoutPeriod;

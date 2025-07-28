@@ -704,6 +704,11 @@ public class MemStore implements HeapSize {
     private KeyValue snapshotNextRow = null;
 
     // last iterated KVs for kvset and snapshot (to restore iterator state after reseek)
+    /**
+     * kvsetNextRow, snapshotNextRow: 这可以理解为两个“指针”或“预读缓存”。
+     * kvsetNextRow 存的是从 kvsetIt 迭代器中取出的下一个有效的 KeyValue，snapshotNextRow 存的是从
+     * snapshotIt 中取出的下一个。
+     */
     private KeyValue kvsetItRow = null;
     private KeyValue snapshotItRow = null;
     
@@ -712,6 +717,11 @@ public class MemStore implements HeapSize {
     private Iterator<KeyValue> snapshotIt;
 
     // The kvset and snapshot at the time of creating this scanner
+    /**
+     * kvsetAtCreation, snapshotAtCreation: 这两个字段保存了扫描器创建那一刻的 kvset 和 snapshot 的引用。
+     * 即使后续 MemStore 发生了 Flush，导致外部的 kvset 和 snapshot 引用改变，
+     * 这个扫描器仍然会继续使用它创建时锁定的旧集合，保证了读取的一致性视图（Snapshot Isolation）。
+     */
     private KeyValueSkipListSet kvsetAtCreation;
     private KeyValueSkipListSet snapshotAtCreation;
 

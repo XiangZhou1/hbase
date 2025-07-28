@@ -2218,6 +2218,7 @@ public class HRegion implements HeapSize { // , Writable{
       List<KeyValueScanner> additionalScanners) throws IOException {
     startRegionOperation(Operation.SCAN);
     try {
+      // 准备 Scanner，例如检查列族是否存在
       // Verify families are all valid
       prepareScanner(scan);
       if(scan.hasFamilies()) {
@@ -2225,6 +2226,7 @@ public class HRegion implements HeapSize { // , Writable{
           checkFamily(family);
         }
       }
+      // 核心：实例化 RegionScanner
       return instantiateRegionScanner(scan, additionalScanners);
     } finally {
       closeRegionOperation(Operation.SCAN);
@@ -2239,12 +2241,15 @@ public class HRegion implements HeapSize { // , Writable{
   // 最终形成一个由 KeyValueHeap 驱动的、合并了所有数据源的扫描器
   protected RegionScanner instantiateRegionScanner(Scan scan,
       List<KeyValueScanner> additionalScanners) throws IOException {
+    // 根据扫描方向（正向或反向）创建不同类型的 RegionScanner 实现
     if (scan.isReversed()) {
       if (scan.getFilter() != null) {
         scan.getFilter().setReversed(true);
       }
+      // ... 创建 ReversedRegionScannerImpl
       return new ReversedRegionScannerImpl(scan, additionalScanners, this);
     }
+    // 对于 Get 操作，总是创建正向的 RegionScannerImpl
     return new RegionScannerImpl(scan, additionalScanners, this);
   }
 
@@ -4425,6 +4430,13 @@ public class HRegion implements HeapSize { // , Writable{
           Store store = stores.get(entry.getKey());
           KeyValueScanner scanner;
           try {
+            // 2. 调用 store.getScanner(...)
+            // 这一步会为该 Store 创建一个 StoreScanner。
+            // StoreScanner 内部会：
+            //   a. 为 MemStore 创建一个 Scanner。
+            //   b. 为该 Store 下的所有 HFile 创建 HFileScanner。
+            //   c. 将这些 Scanner (来自 MemStore 和 HFiles) 放入一个 KeyValueHeap (最小堆) 中。
+            //      这样，StoreScanner.next() 总是能返回该 Store 中版本最新的、排序最前的 KeyValue。
             scanner = store.getScanner(scan, entry.getValue(), this.readPt);
           } catch (FileNotFoundException e) {
             abortRegionServer(e.getMessage());
@@ -4675,6 +4687,10 @@ public class HRegion implements HeapSize { // , Writable{
           // Check if rowkey filter wants to exclude this row. If so, loop to next.
           // Technically, if we hit limits before on this row, we don't need this call.
           // 调用 filterRowKey()，让过滤器有机会基于行键提前过滤掉整行，如果被过滤，则跳到下一行（nextRow()）并重新开始 while 循环。
+          /**
+           * ● 应用行键过滤器: 将 currentRow 的键交给过滤器（Filter）处理。像 PrefixFilter 这样的过滤器可以在这个阶段就高效地判断出整行数据是否需要被处理。
+           * ● 如果被过滤: 如果过滤器决定跳过这一行，方法会执行一个“快进”操作，快速地将 storeHeap 中所有属于 currentRow 的数据全部丢弃，然后利用 while 循环自动进入下一行的处理。
+           */
           if (filterRowKey(currentRow, offset, length)) {
             boolean moreRows = !isFilterDoneInternal() && nextRow(currentRow, offset, length);
             if (!moreRows) return false;
@@ -4685,6 +4701,14 @@ public class HRegion implements HeapSize { // , Writable{
            *   ○ 调用 populateResult(results, this.storeHeap, ...)。
            *   ○ 此方法会从 storeHeap 中不断地调用 next()，将所有属于 currentRow 的 KeyValue 提取出来，
            *     放入 results 列表，直到遇到下一行的数据或达到 limit（如 batch 或 maxResultSize）限制。
+           *
+           *
+           *
+           *
+           *  ● 从主堆拉取数据: 如果行键通过了过滤，方法就会开始调用 storeHeap.next()，把所有属于 currentRow 的单元格（Cell）从堆中真正地拿出来，并放入一个临时的结果列表 results 中。
+           * ● 处理批量限制: 这个过程会一直持续，直到 currentRow 的所有必需单元格都被取出，或者达到了用户设置的 batch 或 maxResultSize 限制。
+           *       如果是因为达到限制而中断，方法会直接返回 true，表示当前批次已满，但还有更多数据。
+           *
            */
           KeyValue nextKv = populateResult(results, this.storeHeap, limit, currentRow, offset,
               length);
@@ -5506,16 +5530,24 @@ public class HRegion implements HeapSize { // , Writable{
   public Result get(final Get get) throws IOException {
     checkRow(get.getRow(), "Get");
     // Verify families are all valid
+    // 检查 Get 请求中指定的列族是否存在于表定义中
     if (get.hasFamilies()) {
       for (byte [] family: get.familySet()) {
         checkFamily(family);
       }
     } else { // Adding all families to scanner
+      // 如果客户端没有指定任何列族，则默认查询所有列族
       for (byte[] family: this.htableDescriptor.getFamiliesKeys()) {
         get.addFamily(family);
       }
     }
+    // 2. 调用内部 get 方法，开始核心逻辑
+    // withCoprocessor=true 表示需要执行协处理器钩子
     List<Cell> results = get(get, true);
+
+    // 3. 构造并返回最终结果
+    // Result.create 会将 Cell 列表封装成一个 Result 对象。
+    // 如果是只检查存在性(existence-only)的 Get, 那么只要 results 不为空，就表示存在。
     return Result.create(results, get.isCheckExistenceOnly() ? !results.isEmpty() : null);
   }
 
@@ -5557,13 +5589,23 @@ public class HRegion implements HeapSize { // , Writable{
        *       ● HFileScanner：为该 Store 下的每一个 HFile（已持久化的数据文件）创建一个扫描器。
        */
       scanner = getScanner(scan);
+
+      // 4. 从 Scanner 中拉取数据
+      // 调用 scanner.next(results)，这个方法会从 Scanner 的内部堆（KeyValueHeap）中
+      // 拉取所有属于目标行（由 scan 的 startRow/stopRow 限定）的 KeyValue (Cell)，
+      // 并放入 results 列表中。因为是 Get 操作，这个 next 调用一次就会取完所有需要的数据。
       scanner.next(results);
     } finally {
+      // 5. 关闭 Scanner，释放资源
+      // 无论成功与否，都必须关闭 Scanner。
+      // 关闭操作会释放其持有的所有底层 Scanner（StoreScanner, HFileScanner 等）。
       if (scanner != null)
         scanner.close();
     }
 
     // post-get CP hook
+    // 6. [协处理器] post-get 钩子
+    // 在获取到数据之后，给协处理器一个机会来修改或检查返回结果。
     if (withCoprocessor && (coprocessorHost != null)) {
       coprocessorHost.postGet(get, results);
     }

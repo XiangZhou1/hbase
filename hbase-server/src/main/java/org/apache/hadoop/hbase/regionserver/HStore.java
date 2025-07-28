@@ -118,6 +118,14 @@ import com.google.common.collect.Lists;
  *
  * <p>Locking and transactions are handled at a higher level.  This API should
  * not be called directly but by an HRegion manager.
+ *
+ * 核心职责：
+ * ● 数据聚合：管理一个列族的所有数据，包括内存中的 MemStore 和磁盘上所有的 HFile。
+ * ● 写操作代理：接收来自 HRegion 的写请求（Cell），并将其路由到内部的 MemStore。
+ * ● 读操作协调：响应来自 HRegion 的读请求，创建并返回一个 StoreScanner，该 StoreScanner 能够统一扫描该 HStore 的 MemStore 和所有 HFile。
+ * ● Flush 管理：负责执行 Flush 操作，即将 MemStore 的快照数据写入一个新的 HFile。
+ * ● Compaction 调度与执行：根据策略决定何时发起 Compaction，选择哪些 HFile 进行合并，并执行合并操作。
+ * ● 元数据管理：维护本列族的所有 HFile 列表，包括活跃文件和待清理的已合并文件。
  */
 @InterfaceAudience.Private
 public class HStore implements Store {
@@ -1992,7 +2000,17 @@ public class HStore implements Store {
   //////////////////////////////////////////////////////////////////////////////
   // File administration
   //////////////////////////////////////////////////////////////////////////////
-
+  /**
+   * ● 它向 StoreFileManager 请求与本次 Scan 范围相关的 所有活跃的 HFile。
+   * ● 它向 MemStore 请求 Scanner（一个用于当前 MemStore，一个用于快照）。
+   * ● 为每个相关的 HFile 创建一个 StoreFileScanner。
+   * ● 最后，将 MemStore 的 Scanner 和所有 StoreFileScanner 放入一个列表中返回给 HRegion。HRegion 会将它们聚合到一个 KeyValueHeap 中进行合并排序。
+   * @param scan Scan to apply when scanning the stores
+   * @param targetCols columns to scan
+   * @param readPt
+   * @return
+   * @throws IOException
+   */
   @Override
   public KeyValueScanner getScanner(Scan scan,
       final NavigableSet<byte []> targetCols, long readPt) throws IOException {
@@ -2002,6 +2020,11 @@ public class HStore implements Store {
       if (this.getCoprocessorHost() != null) {
         scanner = this.getCoprocessorHost().preStoreScannerOpen(this, scan, targetCols);
       }
+      /**
+       * StoreScanner: 这是 HStore 返回的核心对象。
+       * StoreScanner 内部包含一个最小堆 (KeyValueHeap)，它将来自 MemStore 的 Scanner 和所有相关 HFile 的 Scanner 放入堆中。
+       * 每次调用 StoreScanner.next()，它都会从堆顶取出一个最小的 Cell，从而实现了对内存和磁盘数据的无缝、有序合并。
+       */
       if (scanner == null) {
         scanner = scan.isReversed() ? new ReversedStoreScanner(this,
             getScanInfo(), scan, targetCols, readPt) : new StoreScanner(this,
