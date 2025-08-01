@@ -57,10 +57,23 @@ public class ScanQueryMatcher {
   // Optimization so we can skip lots of compares when we decide to skip
   // to the next row.
   private boolean stickyNextRow;
-  private final byte[] stopRow;
 
+  /**
+   * 作用: 存储扫描的结束行键 (exclusive)。
+   * 角色: 行范围的右边界。在 match() 方法中，它不直接参与每次比较，但在 moreRowsMayExistAfter() 方法中用于判断是否还有可能存在更多符合条件的行，
+   *        帮助 StoreScanner 决定是否可以提前终止对某个 HFile 的扫描。
+   */
+  private final byte[] stopRow;
+  /**
+   * 作用: 存储用户指定的时间范围。
+   * 角色: 时间过滤器。在 match() 方法中，每个 KeyValue 的时间戳都会与这个 TimeRange 进行比较，不符合的将被直接过滤掉。
+   */
   private final TimeRange tr;
 
+  /**
+   * 作用: 存储用户自定义的过滤器。
+   * 角色: 高级、灵活的审判官。这是最强大的过滤机制。filter 可以基于 KeyValue 的任意部分（行、列、值、时间戳）做出复杂的过滤决策，甚至可以改变扫描的行为（如 SEEK_NEXT_USING_HINT）。
+   */
   private final Filter filter;
 
   /** Keeps track of deletes
@@ -84,12 +97,25 @@ public class ScanQueryMatcher {
    * 3. Whether a scan can do time travel queries even before deleted
    *    marker to reach deleted rows.
    */
-  /** whether to retain delete markers */
+  /** whether to retain delete markers
+   * 作用: 是否在输出中保留删除标记本身。
+   * 角色: Compaction 指令。在 Minor Compaction 或 Raw Scan 中，此值为 true，删除标记会被保留下来。
+   * 在 Major Compaction 中，此值通常为 false（除非有特殊配置），删除标记和其覆盖的数据会被物理清除。
+   *
+   * */
   private boolean retainDeletesInOutput;
 
-  /** whether to return deleted rows */
+  /** whether to return deleted rows
+   * 作用: 定义了如何处理已被删除的单元格（即那些被删除标记覆盖的 Put）。
+   *        KeepDeletedCells 是一个枚举，有 TRUE, FALSE, TTL 三种值。
+   * 角色: 数据保留策略。决定了即使用户数据被删除了，是否还要在存储层面保留一段时间
+   *       （例如，为了支持快照扫描或满足数据合规要求）。
+   * */
   private final KeepDeletedCells keepDeletedCells;
-  /** whether time range queries can see rows "behind" a delete */
+  /** whether time range queries can see rows "behind" a delete
+   * 作用: 对于用户扫描，是否可以看到被删除标记“背后”的、更旧版本的数据。
+   * 角色: 时间旅行开关。如果为 true，即使用户数据被删除了，扫描仍然可以“穿越”删除标记，获取符合时间范围的、更旧的版本。
+   * */
   private final boolean seePastDeleteMarkers;
 
 
@@ -102,7 +128,11 @@ public class ScanQueryMatcher {
    * */
   private final ColumnTracker columns;
 
-  /** Key to seek to in memstore and StoreFiles */
+  /** Key to seek to in memstore and StoreFiles
+   * 作用: 存储一个根据 scan.getStartRow() 构建的 KeyValue。这个 KeyValue 通常是指定行的第一个可能位置（createFirstDeleteFamilyOnRow）。
+   * 角色: 扫描的起始点。StoreScanner 使用它来初始化其内部的 KeyValueHeap，确保从正确的位置开始扫描。
+   *
+   * */
   private final KeyValue startKey;
 
   /** Row comparator for the region this query is for */
@@ -159,6 +189,11 @@ public class ScanQueryMatcher {
   // marker will not be removed just because there are no Puts that it is
   // currently influencing. This is because Puts, that this delete can
   // influence.  may appear out of order.
+  /**
+   * 作用: 删除标记在被物理清除前需要存活的最短时间。
+   * 角色: 删除标记的“保护期”。在 Major Compaction 期间，即使一个删除标记已经覆盖了所有可见数据，
+   *    但如果它的存活时间小于此值，它仍然会被保留下来。这是为了防止因乱序写入（如跨集群复制）导致旧数据“复活”。
+   */
   private final long timeToPurgeDeletes;
   
   private final boolean isUserScan;
