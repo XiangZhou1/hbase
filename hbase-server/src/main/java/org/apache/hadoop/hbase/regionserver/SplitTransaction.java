@@ -92,6 +92,13 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
  * </Pre>
  * <p>This class is not thread safe.  Caller needs ensure split is run by
  * one thread only.
+ *
+ * SplitTransaction 的设计充分体现了事务性（Transactionality）和可恢复性（Recoverability）。
+ * ● 事务性: 它将分裂操作视为一个事务，有明确的准备（prepare）、执行（execute）和回滚（rollback）阶段。
+ * ● 日志/日记 (Journal): 内部维护一个 journal 列表，每完成一步关键操作，就向 journal 中添加一条 JournalEntry。这个日志是实现精确回滚的基础。
+ * ● 不归点 (Point of No Return - PONR): 设计中最核心的概念。它定义了事务中的一个临界点。
+ *       在此之前，任何失败都可以安全地回滚；在此之后，失败将导致无法自动回滚，必须通过更激烈的方式（如中止 RegionServer）来保证数据一致性。
+ * ● 非线程安全: 它被设计为由单个线程（SplitRequest）驱动，内部状态不考虑并发修改。
  */
 @InterfaceAudience.Private
 public class SplitTransaction {
@@ -116,6 +123,18 @@ public class SplitTransaction {
    * Types to add to the transaction journal.
    * Each enum is a step in the split transaction. Used to figure how much
    * we need to rollback.
+   *
+   * 这是理解整个流程的**“地图”**。它定义了分裂事务的所有关键步骤，按执行顺序列出：
+   * ● STARTED, PREPARED: 事务初始化和基本检查。
+   * ● BEFORE/AFTER_PRE_SPLIT_HOOK: 执行协处理器（Coprocessor）的钩子，允许用户自定义逻辑介入。
+   * ● SET_SPLITTING_IN_ZK: 在 ZooKeeper 中创建一个节点，向 Master 和其他组件宣告“我准备分裂了”。
+   * ● CREATE_SPLIT_DIR: 在 HDFS 上创建临时分裂目录。
+   * ● CLOSED_PARENT_REGION: 关闭父 Region，将其所有内存数据（MemStore）刷写到磁盘。
+   * ● OFFLINED_PARENT: 将父 Region 从 RegionServer 的在线服务列表中移除。
+   * ● STARTED_REGION_A/B_CREATION: 开始创建两个子 Region 的文件结构。
+   * ● OPENED_REGION_A/B: 成功打开两个子 Region。
+   * ● BEFORE/AFTER_POST_SPLIT_HOOK: 执行分裂完成后的协处理器钩子。
+   * ● PONR (Point of No Return): 不归点。这是最关键的一步，紧接着就要去修改 hbase:meta 表了。
    */
   static enum JournalEntryType {
     /**
@@ -207,6 +226,7 @@ public class SplitTransaction {
 
   /*
    * Journal of how far the split transaction has progressed.
+   * 它像一个飞行记录仪（黑匣子），忠实地记录了事务走到了哪一步。当需要回滚时，程序会反向遍历这个 journal，根据记录的步骤执行相反的清理操作。
    */
   private final List<JournalEntry> journal = new ArrayList<JournalEntry>();
 
@@ -794,6 +814,7 @@ public class SplitTransaction {
   throws IOException {
     useZKForAssignment =
         server == null ? true : ConfigUtil.useZKForAssignment(server.getConfiguration());
+    // 创建子region
     PairOfSameType<HRegion> regions = createDaughters(server, services, user);
     if (this.parent.getCoprocessorHost() != null) {
       if (user == null) {
@@ -814,6 +835,7 @@ public class SplitTransaction {
         }
       }
     }
+    // 包含了关闭父 Region、创建引用文件等关键步骤。这些步骤在 PONR（Point of No Return）之前完成，理论上都是可回滚的。
     return stepsAfterPONR(server, services, regions, user);
   }
 

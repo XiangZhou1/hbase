@@ -81,6 +81,15 @@ import org.apache.zookeeper.data.Stat;
 import com.google.common.annotations.VisibleForTesting;
 
 /**
+ * ● 任务发布 (Task Publishing): 当 Master 检测到有 RegionServer 宕机，需要恢复其 WAL 日志时，SplitLogManager 负责将这些待处理的日志文件转换成一个个“任务”，并发布到 ZooKeeper 的 /hbase/splitlog 目录下。
+ * ● 进度监控 (Progress Monitoring): 它持续监视 ZK 中所有任务的状态。通过 SplitLogWorker 的心跳（更新 ZNode 版本号），它能知道哪些任务正在被处理，以及处理了多长时间。
+ * ● 超时与故障处理 (Timeout and Failure Handling):
+ *   ○ 任务超时: 如果一个任务长时间没有心跳更新，SplitLogManager 会认为持有该任务的 worker 可能已经卡住或失联。
+ *   ○ Worker 宕机: 如果 Master 检测到某个 RegionServer (worker) 宕机，SplitLogManager 会立即处理该 worker 持有的所有任务。
+ *   ○ 任务重分配 (Resubmission): 对于超时或由宕机 worker 持有的任务，SplitLogManager 会将其强制重置为 UNASSIGNED 状态，让其他健康的 worker 重新去竞争和执行。
+ * ● 任务完成与清理 (Task Completion and Cleanup): 当一个任务被 worker 标记为 DONE 时，SplitLogManager 会执行最后的“收尾”工作（通过 TaskFinisher），然后从 ZK 中删除该任务节点。
+ * ● 协调整个流程: splitLogDistributed() 方法是其对外提供的主要接口，它接收待分裂的日志目录， orchestrates 整个分布式分裂流程，并阻塞等待直到所有相关的日志文件都被处理完毕。
+ *
  * Distributes the task of log splitting to the available region servers.
  * Coordination happens via zookeeper. For every log file that has to be split a
  * znode is created under <code>/hbase/splitlog</code>. SplitLogWorkers race to grab a task.
@@ -308,7 +317,9 @@ public class SplitLogManager extends ZooKeeperListener {
    * have been processed - successfully split or an error is encountered - by an
    * available worker region server. This method must only be called after the
    * region servers have been brought online.
-   *
+   * 调用者将在此方法中阻塞，直到给定 RegionServer 的所有日志文件都被一个可用的
+   * worker RegionServer 处理完毕——无论是成功分裂还是遇到错误。
+   * 此方法必须在 RegionServer 上线后才能调用。
    * @param logDirs List of log dirs to split
    * @param filter the Path filter to select specific files for considering
    * @throws IOException If there was an error while splitting any log file
@@ -316,8 +327,10 @@ public class SplitLogManager extends ZooKeeperListener {
    */
   public long splitLogDistributed(final Set<ServerName> serverNames, final List<Path> logDirs,
       PathFilter filter) throws IOException {
+    // 1. 创建一个监控任务，用于在 HBase UI 上展示进度
     MonitoredTask status = TaskMonitor.get().createStatus(
           "Doing distributed log split in " + logDirs);
+    // 2. 获取 HDFS 上所有需要分裂的日志文件的状态列表
     FileStatus[] logfiles = getFileList(logDirs, filter);
     status.setStatus("Checking directory contents...");
     LOG.debug("Scheduling batch of logs to split");
@@ -325,8 +338,11 @@ public class SplitLogManager extends ZooKeeperListener {
     LOG.info("started splitting " + logfiles.length + " logs in " + logDirs);
     long t = EnvironmentEdgeManager.currentTimeMillis();
     long totalSize = 0;
+
+    // 3. 创建一个任务批次对象（TaskBatch），用于追踪这批任务的总体进度。
     TaskBatch batch = new TaskBatch();
     Boolean isMetaRecovery = (filter == null) ? null : false;
+    // 4. 遍历所有日志文件，为每一个文件发布一个分裂任务
     for (FileStatus lf : logfiles) {
       // TODO If the log file is still being written to - which is most likely
       // the case for the last log file - then its length will show up here
@@ -334,11 +350,15 @@ public class SplitLogManager extends ZooKeeperListener {
       // recover-lease is done. totalSize will be under in most cases and the
       // metrics that it drives will also be under-reported.
       totalSize += lf.getLen();
+      // 将 HDFS 绝对路径转换为相对路径作为任务名
       String pathToLog = FSUtils.removeRootPath(lf.getPath(), conf);
+      // 调用 enqueueSplitTask 将任务发布到 ZooKeeper
       if (!enqueueSplitTask(pathToLog, batch)) {
         throw new IOException("duplicate log split scheduled for " + lf.getPath());
       }
     }
+
+    // 5. 进入等待阶段，阻塞当前线程，直到这批任务全部完成。
     waitForSplittingCompletion(batch, status);
     // remove recovering regions from ZK
     if (filter == MasterFileSystem.META_FILTER /* reference comparison */) {
@@ -348,6 +368,7 @@ public class SplitLogManager extends ZooKeeperListener {
     }
     this.removeRecoveringRegionsFromZK(serverNames, isMetaRecovery);
 
+    // 6. 检查最终结果。如果完成的任务数不等于发布的任务数，说明有错误发生。
     if (batch.done != batch.installed) {
       batch.isDead = true;
       SplitLogCounters.tot_mgr_log_split_batch_err.incrementAndGet();
@@ -358,6 +379,8 @@ public class SplitLogManager extends ZooKeeperListener {
       status.abort(msg);
       throw new IOException(msg);
     }
+
+    // 7. 成功完成后，清理 HDFS 上原始的日志目录
     for(Path logDir: logDirs){
       status.setStatus("Cleaning up log directory...");
       try {
@@ -375,6 +398,8 @@ public class SplitLogManager extends ZooKeeperListener {
       }
       SplitLogCounters.tot_mgr_log_split_batch_success.incrementAndGet();
     }
+
+    // 8. 标记监控任务完成，并打印成功日志
     String msg = "finished splitting (more than or equal to) " + totalSize +
         " bytes in " + batch.installed + " log files in " + logDirs + " in " +
         (EnvironmentEdgeManager.currentTimeMillis() - t) + "ms";

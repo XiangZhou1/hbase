@@ -70,6 +70,11 @@ public abstract class RegionSplitPolicy extends Configured {
    * previously returned true.
    */
   protected byte[] getSplitPoint() {
+    /**
+     *     显式分裂点优先: 首先检查 Region 是否有一个手动设置的分裂点（region.getExplicitSplitPoint()）。
+     *     这通常是管理员通过 shell 命令 split 'tableName', 'splitKey' 强制设置的。
+     *     如果存在，直接返回这个最高优先级的键。
+     */
     byte[] explicitSplitPoint = this.region.getExplicitSplitPoint();
     if (explicitSplitPoint != null) {
       return explicitSplitPoint;
@@ -79,6 +84,12 @@ public abstract class RegionSplitPolicy extends Configured {
     byte[] splitPointFromLargestStore = null;
     long largestStoreSize = 0;
     for (Store s : stores.values()) {
+      /**
+       *     ■ 最大 Store 的分裂点: 如果没有显式分裂点，策略会遍历 Region 内所有的 Store (即 Column Family)。
+       *     ■ 它会找到其中尺寸最大 (size) 的那个 Store。
+       *     ■ 然后，它会调用这个最大 Store 的 getSplitPoint() 方法，该方法通常会返回这个 Store 中所有 HFile 的中心键 (mid-key)。
+       *     ■ 最终，最大 Store 的中心键被作为整个 Region 的分裂点。
+       */
       byte[] splitPoint = s.getSplitPoint();
       long storeSize = s.getSize();
       if (splitPoint != null && largestStoreSize < storeSize) {

@@ -710,6 +710,11 @@ public class StoreFile {
 
   /**
    * Gets the approximate mid-point of this file that is optimal for use in splitting it.
+   * ● this.reader: 指的是一个 HFile.Reader 对象。HFile 是存储在 HDFS 上的物理文件，Reader 则是读取这个文件内容的接口。
+   * ● KeyValue (KV): HBase 中存储的最小数据单元，它包含了行键、列族、列限定符、时间戳、值等所有信息。在代码中，它被序列化成一个 byte[] 进行传输和存储。
+   * ● midkey(): 这是 HFile.Reader 提供的一个极其高效的方法。HFile 内部是由多个数据块 (Data Block) 组成的。midkey() 不是去扫描整个文件找到字节流正中间的那个 KeyValue。
+   *        相反，它会查看 HFile 的索引，快速定位到文件物理大小上处于中间位置的那个数据块，然后返回这个中间数据块的第一个 KeyValue。这是一种近似但非常快速的获取文件中点键的方法。
+   * ● KVComparator: 一个比较器，用于比较两个 KeyValue 对象。compareRows 方法专门只比较两个 KeyValue 的行键部分。
    * @param comparator Comparator used to compare KVs.
    * @return The split point row, or null if splitting is not possible, or reader is null.
    */

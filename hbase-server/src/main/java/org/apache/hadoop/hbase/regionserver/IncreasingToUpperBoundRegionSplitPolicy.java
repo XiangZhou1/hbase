@@ -65,14 +65,34 @@ extends ConstantSizeRegionSplitPolicy {
 
   @Override
   protected boolean shouldSplit() {
+    // 检查强制分裂: boolean force = region.shouldForceSplit(); (与父类相同)
     boolean force = region.shouldForceSplit();
     boolean foundABigStore = false;
     // Get count of regions that have the same common table as this.region
+    /**
+     * ● 获取同表 Region 数量:
+     *   ○ int tableRegionsCount = getCountOfCommonTableRegions();
+     *   ○ 这是关键的第一步。它会调用 getCountOfCommonTableRegions() 方法，去询问当前的 RegionServerServices：“在这台 RegionServer 上，有多少个在线的 Region 是属于 my_table 这张表的？”
+     *   ○ 这个 tableRegionsCount 是动态计算分裂阈值的核心输入。
+     */
     int tableRegionsCount = getCountOfCommonTableRegions();
     // Get size to check
+    /**
+     * ● 计算动态分裂阈值:
+     *   ○ long sizeToCheck = getSizeToCheck(tableRegionsCount);
+     *   ○ 调用 getSizeToCheck() 方法来计算本次检查应该使用的分裂阈值。
+     */
     long sizeToCheck = getSizeToCheck(tableRegionsCount);
 
     for (Store store : region.getStores().values()) {
+      /**
+       * ● 遍历 Store 并检查: (与父类类似，但阈值不同)
+       *   ○ 遍历 Region 内的所有 Store。
+       *   ○ 检查每个 Store 是否 canSplit() (不含引用文件)。
+       *   ○ 获取 Store 中最大 HFile 的大小 size。
+       *   ○ 将 size 与刚刚计算出的动态阈值 sizeToCheck 进行比较。
+       *   ○ if (size > sizeToCheck): 如果任何一个 HFile 大小超过了动态计算出的阈值，就认为应该分裂。
+       */
       // If any of the stores is unable to split (eg they contain reference files)
       // then don't split
       if ((!store.canSplit())) {
@@ -98,8 +118,10 @@ extends ConstantSizeRegionSplitPolicy {
    */
   protected long getSizeToCheck(final int tableRegionsCount) {
     // safety check for 100 to avoid numerical overflow in extreme cases
+    // 安全检查，防止 tableRegionsCount 为 0 或过大导致数值溢出
     return tableRegionsCount == 0 || tableRegionsCount > 100 ? getDesiredMaxFileSize():
       Math.min(getDesiredMaxFileSize(),
+        // 动态计算分裂大小
         this.initialSize * tableRegionsCount * tableRegionsCount * tableRegionsCount);
   }
 

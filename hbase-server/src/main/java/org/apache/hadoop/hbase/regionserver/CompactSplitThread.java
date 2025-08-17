@@ -64,11 +64,19 @@ public class CompactSplitThread implements CompactionRequestor {
   private final HRegionServer server;
   private final Configuration conf;
 
+  // 用于执行“大型” Compaction 任务的线程池。
   private final ThreadPoolExecutor largeCompactions;
+  // 用于执行“小型” Compaction 任务的线程池。
   private final ThreadPoolExecutor smallCompactions;
+  // 用于执行 Region 分裂任务的线程池。
   private final ThreadPoolExecutor splits;
+  // 用于执行 Region 合并任务的线程池。
   private final ThreadPoolExecutor mergePool;
 
+  /**
+   * 吞吐量控制器: 它持有一个 CompactionThroughputController 的实例，用于根据当前集群的负载情况，
+   * 动态地限制 Compaction 操作所能使用的 I/O 吞吐量，防止后台任务对线上读写请求产生过大的影响。
+   */
   private final CompactionThroughputController compactionThroughputController;
 
   /**
@@ -213,6 +221,14 @@ public class CompactSplitThread implements CompactionRequestor {
     }
   }
 
+  /**
+   *   ○ 分裂条件检查: shouldSplitRegion()。检查当前 RegionServer 的总 Region 数量是否已经超过了 hbase.regionserver.regionSplitLimit。这是一个保护性配置，防止因无限分裂导致 Master 负载过高。
+   *   ○ 优先级检查: 检查 Region 的 compactPriority。如果一个 Region 正处于高优先级的 Compaction 压力下（例如 HFile 数量过多），通常会优先进行 Compaction 而不是 Split。
+   *   ○ 获取分裂点: r.checkSplit()。委托 HRegion 根据其 RegionSplitPolicy 计算最佳的分裂点（midKey）。
+   *   ○ 提交任务: 如果找到了有效的分裂点，就创建一个 SplitRequest 对象，并将其提交到 splits 线程池中。
+   * @param r
+   * @return
+   */
   public synchronized boolean requestSplit(final HRegion r) {
     // don't split regions that are blocking
     if (shouldSplitRegion() && r.getCompactPriority() >= Store.PRIORITY_USER) {
@@ -433,6 +449,11 @@ public class CompactSplitThread implements CompactionRequestor {
     return splits.getQueue().size();
   }
 
+  /**
+   * 检查当前 RegionServer 的 Region 总数是否小于 regionSplitLimit。
+   * 如果接近或超过上限，则直接返回 false，不进行分裂。
+   * @return
+   */
   private boolean shouldSplitRegion() {
     if(server.getNumberOfOnlineRegions() > 0.9*regionSplitLimit) {
       LOG.warn("Total number of regions is approaching the upper limit " + regionSplitLimit + ". "
