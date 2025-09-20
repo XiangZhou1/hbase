@@ -37,6 +37,16 @@ import org.apache.hadoop.hbase.util.ReflectionUtils;
 /**
  * Default StoreEngine creates the default compactor, policy, and store file manager, or
  * their derivatives.
+ * DefaultStoreEngine 是 StoreEngine 抽象类的默认实现。它的核心作用是创建并组装一个 HStore 所需的核心策略组件。
+ * ● 组件工厂 (Component Factory): HStore 自身不直接创建 StoreFlusher、CompactionPolicy 等策略对象。相反，它会创建一个 StoreEngine 实例，并委托 StoreEngine 来完成这些组件的创建和管理。DefaultStoreEngine 就是这个默认的工厂。
+ * ● 策略的集合: 一个 StoreEngine 实例持有了一个 HStore 运行所需的一整套策略对象，包括：
+ *   ○ StoreFlusher: 负责执行 Flush 操作。
+ *   ○ CompactionPolicy: 负责决策 Compaction 操作。
+ *   ○ Compactor: 负责执行 Compaction 操作。
+ *   ○ StoreFileManager: 负责管理 HFile 列表。
+ * ● 可插拔架构的体现: StoreEngine 的设计是 HBase 可插拔架构的一个完美体现。HBase 定义了 StoreEngine 这个抽象层，而 DefaultStoreEngine 提供了默认的实现。用户可以通过配置 hbase.hstore.engine.class 来替换掉 DefaultStoreEngine，从而整体替换掉一个 HStore 的所有核心策略。例如，Stripe Compaction 就是通过一个自定义的 StripeStoreEngine 来实现的。
+ * ● 泛型定义: public class DefaultStoreEngine extends StoreEngine<DefaultStoreFlusher, RatioBasedCompactionPolicy, DefaultCompactor, DefaultStoreFileManager>
+ *   ○ 这个泛型定义清晰地表明了 DefaultStoreEngine 组装的是哪些默认的组件类型。
  */
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
 public class DefaultStoreEngine extends StoreEngine<

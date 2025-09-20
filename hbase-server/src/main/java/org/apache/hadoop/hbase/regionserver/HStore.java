@@ -593,10 +593,21 @@ public class HStore implements Store {
     return storeFile;
   }
 
+  /**
+   * 流程：HRegion 将 KeyValue 传递给对应的 HStore，HStore 加读锁后，
+   * 直接调用 memstore.add() 方法将数据插入内存中的跳表（SkipList）。
+   *
+   * 关键点：写入内存的操作非常快，这是 HBase 高写性能的基础。删除（delete）操作在底层也是一次写入，
+   * 它会写入一个带有 "Delete" 标记的特殊 KeyValue。
+   * @param kv
+   * @return
+   */
   @Override
   public long add(final KeyValue kv) {
+    // 获取读锁，允许多个写操作并发
     lock.readLock().lock();
     try {
+      // 直接写入 MemStore
       return this.memstore.add(kv);
     } finally {
       lock.readLock().unlock();
@@ -808,10 +819,13 @@ public class HStore implements Store {
    * Snapshot this stores memstore. Call before running
    * {@link #flushCache(long, SortedSet, TimeRangeTracker, AtomicLong, MonitoredTask)}
    *  so it has some work to do.
+   *  此操作会创建一个当前 MemStore 的只读副本（snapshot），并将活动的 MemStore 清空，用于接收新的写入。
+   *  这样，刷写过程不会阻塞新的写入请求。
    */
   void snapshot() {
     this.lock.writeLock().lock();
     try {
+      // 创建一个当前 memstore 的只读快照
       this.memstore.snapshot();
     } finally {
       this.lock.writeLock().unlock();
@@ -828,6 +842,9 @@ public class HStore implements Store {
    * @param status
    * @return The path name of the tmp file to which the store was flushed
    * @throws IOException
+   *
+   * 核心：将 snapshot 中的数据写入一个位于 HDFS 临时目录（.tmp/）下的新 HFile 文件。
+   * 写到临时目录是为了保证操作的原子性：如果中途失败，不会影响到正式的数据目录。
    */
   protected List<Path> flushCache(final long logCacheFlushId,
       SortedSet<KeyValue> snapshot,
@@ -888,6 +905,7 @@ public class HStore implements Store {
    * @param logCacheFlushId
    * @return StoreFile created.
    * @throws IOException
+   * commitFile: 当临时文件写入成功后，HStore 会调用 fs.commitStoreFile()，这是一个 原子性的 rename 操作，将临时文件移动到该列族正式的数据目录下
    */
   private StoreFile commitFile(final Path path,
       final long logCacheFlushId,
@@ -1014,7 +1032,9 @@ public class HStore implements Store {
       final List<StoreFile> sfs, final SortedSet<KeyValue> set) throws IOException {
     this.lock.writeLock().lock();
     try {
+      // 1. 将新生成的 StoreFile 对象加入 StoreFileManager 的活跃文件列表中
       this.storeEngine.getStoreFileManager().insertNewFiles(sfs);
+      // 2. 清理掉已经成功持久化的 memstore 快照
       this.memstore.clearSnapshot(set);
     } finally {
       // We need the lock, as long as we are updating the storeFiles
@@ -1026,6 +1046,7 @@ public class HStore implements Store {
     }
 
     // Tell listeners of the change in readers.
+    // 3. 通知所有活跃的 Scanner，底层的 HFile 列表已经发生变化
     notifyChangedReadersObservers();
 
     if (LOG.isTraceEnabled()) {
@@ -1038,6 +1059,7 @@ public class HStore implements Store {
           + "," + storeSize + "," + storeEngine.getStoreFileManager().getStorefileCount() + "]";
       LOG.trace(traceMessage);
     }
+    // 检查是否需要触发一次 Compaction
     return needsCompaction();
   }
 
@@ -1180,6 +1202,10 @@ public class HStore implements Store {
       // 1. **执行文件合并**
       //    compaction.compact() 内部会创建 scanners, writer，并执行数据泵送
       //    最终返回新生成的临时 HFile 的路径列表
+      // 1. **执行文件合并**
+      //    compaction.compact() 内部会创建 Scanners, Writer，
+      //    从所有输入文件读取数据，经过过滤（删除、过期）、合并后，
+      //    写入一个新的或多个新的 HFile 到 .tmp 临时目录。
       List<Path> newFiles = compaction.compact(throughputController, user);
 
       // TODO: get rid of this!
@@ -1220,6 +1246,7 @@ public class HStore implements Store {
       logCompactionEndMessage(cr, sfs, compactionStartTime);
       return sfs;
     } finally {
+      // 4. 从 filesCompacting 列表中移除这些文件，表示合并完成
       finishCompactionRequest(cr);
     }
   }
@@ -1608,6 +1635,7 @@ public class HStore implements Store {
     LOG.debug(getRegionInfo().getEncodedName() + " - " + getColumnFamilyName() + ": Initiating "
         + (compaction.getRequest().isMajor() ? "major" : "minor") + " compaction");
     this.region.reportCompactionRequestStart(compaction.getRequest().isMajor());
+    // 4. 返回一个 CompactionContext 对象，封装了这次合并请求的所有信息
     return compaction;
   }
 
@@ -2024,6 +2052,23 @@ public class HStore implements Store {
        * StoreScanner: 这是 HStore 返回的核心对象。
        * StoreScanner 内部包含一个最小堆 (KeyValueHeap)，它将来自 MemStore 的 Scanner 和所有相关 HFile 的 Scanner 放入堆中。
        * 每次调用 StoreScanner.next()，它都会从堆顶取出一个最小的 Cell，从而实现了对内存和磁盘数据的无缝、有序合并。
+       */
+      /**
+       * StoreScanner: 这是 HStore 返回的核心对象。
+       * StoreScanner 内部包含一个最小堆 (KeyValueHeap)，它将来自 MemStore 的 Scanner
+       * 和所有相关 HFile 的 Scanner 放入堆中。
+       * 每次调用 StoreScanner.next()，它都会从堆顶取出一个最小的 Cell，
+       * 从而实现了对内存和磁盘数据的无缝、有序合并。
+       */
+      /**
+       * 流程: HStore 并不亲自读取数据。它扮演一个扫描器工厂的角色。
+       * 它向 StoreFileManager 请求与本次 Scan 范围相关的所有活跃的 HFile。
+       * 它向 MemStore 请求 Scanner（一个用于当前 MemStore，一个用于 snapshot）。
+       * 为每个相关的 HFile 创建一个 StoreFileScanner。
+       * 最后，将 MemStore 的 Scanner 和所有 StoreFileScanner 统一交给一个 StoreScanner 对象管理。
+       * StoreScanner 的魔法: StoreScanner 内部维护了一个最小堆（KeyValueHeap）。它把所有来源（MemStore, HFiles）的 Scanner 都放入这个堆中。
+       * 每次外部调用 scanner.next()，StoreScanner 就会从堆顶弹出 KeyValue 最小的那个 Scanner，从它那里取一个 KeyValue 返回，然后再把这个 Scanner 放回堆中重新排序。
+       * 通过这种方式，StoreScanner 完美地实现了对多个数据源的合并排序（Merge Sort），对上层调用者屏蔽了底层数据存储的复杂性。
        */
       if (scanner == null) {
         scanner = scan.isReversed() ? new ReversedStoreScanner(this,

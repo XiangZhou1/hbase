@@ -269,6 +269,30 @@ import com.google.protobuf.TextFormat;
 /**
  * HRegionServer makes a set of HRegions available to clients. It checks in with
  * the HMaster. There are many HRegionServers in a single HBase deployment.
+ *
+ * HRegionServer (通常简写为 RS) 是 HBase 集群中的工作节点（Worker Node）。它的主要职责是管理和服务分配给它的一组 Region。客户端的所有数据读写请求最终都会路由到相应的 HRegionServer 上。
+ *
+ * 下面我将分几个部分来详细解析这份代码：
+ *
+ * 核心概述与职责
+ *
+ * 关键组件与数据结构（字段解析）
+ *
+ * 核心生命周期（run() 方法详解）
+ *
+ * 关键 RPC 请求处理流程
+ *
+ * 读请求 (get)
+ *
+ * 写请求 (mutate)
+ *
+ * 扫描请求 (scan)
+ *
+ * Region 打开请求 (openRegion)
+ *
+ * 附有中文注释的源代码
+ *
+ *
  */
 @InterfaceAudience.Private
 @SuppressWarnings("deprecation")

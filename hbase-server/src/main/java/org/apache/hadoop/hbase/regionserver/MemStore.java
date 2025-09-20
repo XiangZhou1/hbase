@@ -65,6 +65,34 @@ import com.google.common.annotations.VisibleForTesting;
  * been deleted.
  * TODO: With new KVSLS, need to make sure we update HeapSize with difference
  * in KV size.
+ *
+ *
+ * MemStore 是 HBase 中的内存写缓存 (In-Memory Write Buffer)。它存在于 HRegionServer 的 Store 组件中。
+ * 为了准确定位 MemStore，我们回顾一下它的层级关系：
+ * HRegionServer -> 托管多个 HRegion
+ * HRegion -> 包含多个 Store (每个列族一个 Store)
+ * Store -> 包含 一个 MemStore 和 零个或多个 HFile
+ * 所以，每一个列族在一个 Region 内都有自己独立的 MemStore。
+ * 核心作用:
+ * ● 提升写入性能: MemStore 将客户端的随机写操作（Put 和 Delete）缓存并聚合在内存中。这避免了每次写入都直接与磁盘（HDFS）进行昂贵的随机 I/O。
+ * ● 保证数据有序: MemStore 内部维护了一个有序的数据结构。当数据被缓存时，它们会按照 RowKey、列族、列限定符、时间戳 的顺序进行排序。这种预排序为后续刷写到 HFile 提供了极大的便利，因为 HFile 本身也是有序的。
+ * ● 服务读请求: 最新的数据（尚未刷写到磁盘的）都存在于 MemStore 中。因此，读请求也会查询 MemStore，以确保能够读取到最新的数据，实现读-写一致性。
+ *
+ *
+ * MemStore 的内部数据结构
+ * 从概念上讲，MemStore 像一个有序的键值对集合。在 HBase 的实现中，它通常是一个基于跳表 (Skip List) 的并发数据结构，具体实现类是 ConcurrentSkipListMap。
+ * 为什么选择跳表？
+ * ● 高并发性能: 跳表允许在不加全局锁的情况下进行高效的并发读写。多个线程可以同时插入、删除和查找，性能优于需要频繁 rebalance 的红黑树等结构。
+ * ● 天然有序: 跳表本身就是一种有序的数据结构，完美契合了 HBase 需要将数据排序后刷写到 HFile 的需求。
+ * ● 范围查询效率高: 对于 Scan 操作，在跳表中进行范围查找非常高效。
+ * MemStore 中存储的每个条目都是一个 Cell (或 KeyValue) 对象，它包含了以下信息：
+ * ● RowKey
+ * ● Column Family (列族)
+ * ● Column Qualifier (列限定符)
+ * ● Timestamp (时间戳)
+ * ● Value (值)
+ * ● Type (操作类型，如 Put 或 Delete)
+ * Delete 操作也会作为一种特殊的 Cell 存入 MemStore，其类型为 Delete 或 DeleteColumn 等，这被称为墓碑标记 (Tombstone)。
  */
 @InterfaceAudience.Private
 public class MemStore implements HeapSize {
@@ -150,12 +178,15 @@ public class MemStore implements HeapSize {
     // If snapshot currently has entries, then flusher failed or didn't call
     // cleanup.  Log a warning.
     if (!this.snapshot.isEmpty()) {
+      // 如果上一次的 snapshot 还没被清理，说明刷盘出错了或流程有问题，直接返回
       LOG.warn("Snapshot called again without clearing previous. " +
           "Doing nothing. Another ongoing flush or did we fail last attempt?");
     } else {
       if (!this.kvset.isEmpty()) {
+        // 1. 将当前 kvset 的引用赋给 snapshot
         this.snapshotSize = keySize();
         this.snapshot = this.kvset;
+        // 2. 创建一个全新的、空的 kvset 用于接收新的写入
         this.kvset = new KeyValueSkipListSet(this.comparator);
         this.snapshotTimeRangeTracker = this.timeRangeTracker;
         this.timeRangeTracker = new TimeRangeTracker();
@@ -163,6 +194,7 @@ public class MemStore implements HeapSize {
         this.size.set(DEEP_OVERHEAD);
         this.snapshotAllocator = this.allocator;
         // Reset allocator so we get a fresh buffer for the new memstore
+        // 3. 创建一个全新的 allocator
         if (allocator != null) {
           this.allocator = new MemStoreLAB(conf, chunkPool);
         }
@@ -230,8 +262,10 @@ public class MemStore implements HeapSize {
    * @return approximate size of the passed key and value.
    */
   long add(final KeyValue kv) {
+    // 1. 尝试使用 MSLAB 分配内存并复制 KeyValue 数据
     KeyValue toAdd = maybeCloneWithAllocator(kv);
     boolean mslabUsed = (toAdd != kv);
+    // 2. 将 KeyValue 插入到跳表中
     return internalAdd(toAdd, mslabUsed);
   }
 
@@ -267,7 +301,9 @@ public class MemStore implements HeapSize {
    * @return the heap size change in bytes
    */
   private long internalAdd(final KeyValue toAdd, boolean mslabUsed) {
+    // 1. 将 KeyValue 加入到跳表中
     boolean notPresent = addToKVSet(toAdd);
+    // 2. 计算并更新 MemStore 的总大小
     long s = heapSizeChange(toAdd, notPresent);
     // If there's already a same cell in the CellSet and we are using MSLAB, we must count in the
     // MSLAB allocation size as well, or else there will be memory leak (occupied heap size larger
@@ -296,6 +332,7 @@ public class MemStore implements HeapSize {
     }
 
     int len = kv.getLength();
+    // 1. 向 MSLAB 请求一块内存
     Allocation alloc = allocator.allocateBytes(len);
     if (alloc == null) {
       // The allocation was too large, allocator decided
@@ -303,7 +340,9 @@ public class MemStore implements HeapSize {
       return kv;
     }
     assert alloc.getData() != null;
+    // 2. 拷贝数据到 MSLAB 的 Chunk 中
     System.arraycopy(kv.getBuffer(), kv.getOffset(), alloc.getData(), alloc.getOffset(), len);
+    // 3. 创建一个新的 KeyValue 对象，其内部的 byte[] 数组指向 MSLAB 的 Chunk
     KeyValue newKv = new KeyValue(alloc.getData(), alloc.getOffset(), len);
     newKv.setMvccVersion(kv.getMvccVersion());
     return newKv;
@@ -784,6 +823,9 @@ public class MemStore implements HeapSize {
       try {
         while (it.hasNext()) {
           v = it.next();
+          // 工作机制：在从迭代器中取出每个 KeyValue 后，getNext 方法会检查其 mvccVersion。
+          // 只有当 mvccVersion 小于等于本次扫描的 readPoint 时，这个 KeyValue 才被认为是“可见的”，并可以被返回。
+          // 否则，它会被直接跳过。
           if (v.getMvccVersion() <= this.readPoint) {
             return v;
           }

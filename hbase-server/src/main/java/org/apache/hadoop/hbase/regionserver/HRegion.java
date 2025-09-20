@@ -227,7 +227,7 @@ public class HRegion implements HeapSize { // , Writable{
    * defining a durability or using USE_DEFAULT will default to this value.
    */
   private static final Durability DEFAULT_DURABLITY = Durability.SYNC_WAL;
-
+  // 状态标志：如 closed, closing 等，用于管理 Region 的生命周期。
   final AtomicBoolean closed = new AtomicBoolean(false);
   /* Closing can take some time; use the closing flag if there is stuff we don't
    * want to do while in closing state; e.g. like offer this region up to the
@@ -391,6 +391,8 @@ public class HRegion implements HeapSize { // , Writable{
   /*
    * Data structure of write state flags used coordinating flushes,
    * compactions and closes.
+   * 一个内部类，用作状态机，包含 flushing, compacting, writesEnabled 等标志位，用于协调后台操作。
+   * 例如，当 flushing 为 true 时，新的 flush 请求会被拒绝。
    */
   static class WriteState {
     // Set while a memstore flush is happening.
@@ -567,10 +569,20 @@ public class HRegion implements HeapSize { // , Writable{
   private long blockingMemStoreSize;
   final long threadWakeFrequency;
   // Used to guard closes
+  /**
+   * “结构变更锁”或“生命周期锁”。
+   * 读锁：被长时间运行的后台操作如 Flush（第二阶段）和 Compaction 获取。它允许常规的读写操作继续进行，但会阻止 Region 被关闭（close）、分裂（split）或合并（merge）。
+   * 写锁：只在 close, split, merge 等改变 Region 结构或生命周期的操作中被获取。它会阻塞所有其他操作，确保 Region 状态变更的原子性和安全性。
+   */
   final ReentrantReadWriteLock lock =
     new ReentrantReadWriteLock();
 
   // Stop updates lock
+  /**
+   * “更新锁”或“数据锁”。这是最繁忙的锁之一。
+   * 读锁：被常规的读（Get, Scan）和写（Put, Delete）操作获取。允许多个读写操作并发进行。
+   * 写锁：只在执行 MemStore 快照（Flush 的第一阶段）等需要暂停所有读写的短暂时刻被获取。它保证了快照的一致性。
+   */
   private final ReentrantReadWriteLock updatesLock =
     new ReentrantReadWriteLock();
   private boolean splitRequest;

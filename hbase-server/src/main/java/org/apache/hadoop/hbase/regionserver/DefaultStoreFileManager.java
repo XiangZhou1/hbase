@@ -48,6 +48,9 @@ class DefaultStoreFileManager implements StoreFileManager {
   private final KVComparator kvComparator;
   private final CompactionConfiguration comConf;
   private final int blockingFileCount;
+  // 这个非常重要，它定义了 storefiles 列表中 StoreFile 对象的 排序规则。
+  // 默认情况下，StoreFile 是按照 Sequence ID 降序 排列的。这意味着最新的文件（Sequence ID 最大）排在列表前面，
+  // 这对于读取操作至关重要，因为需要先从最新的数据开始查找。
   private final Comparator<StoreFile> storeFileComparator;
   /**
    * List of store files inside this store. This is an immutable list that

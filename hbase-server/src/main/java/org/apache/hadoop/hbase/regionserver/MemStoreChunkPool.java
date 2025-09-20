@@ -59,6 +59,7 @@ public class MemStoreChunkPool {
   final static float POOL_INITIAL_SIZE_DEFAULT = 0.0f;
 
   // Static reference to the MemStoreChunkPool
+  //  一个静态的 MemStoreChunkPool 实例。这表明 Chunk Pool 在一个 RegionServer 进程中是全局唯一的、单例的。
   private static MemStoreChunkPool globalInstance;
   /** Boolean whether we have disabled the memstore chunk pool entirely. */
   static boolean chunkPoolDisabled = false;
@@ -66,13 +67,16 @@ public class MemStoreChunkPool {
   private final int maxCount;
 
   // A queue of reclaimed chunks
+  //  一个 BlockingQueue<Chunk>（具体是 LinkedBlockingQueue），这是存储被回收的可复用 Chunk 的核心数据结构。使用阻塞队列可以保证线程安全。
   private final BlockingQueue<Chunk> reclaimedChunks;
+  // int 类型，每个 Chunk 的大小，与 MemStoreLAB 的配置保持一致。
   private final int chunkSize;
 
   /** Statistics thread schedule pool */
   private final ScheduledExecutorService scheduleThreadPool;
   /** Statistics thread */
   private static final int statThreadPeriod = 60 * 5;
+  //  AtomicLong 类型的计数器，用于统计新创建的 Chunk 数量和从池中复用的 Chunk 数量，方便监控池的效率。
   private AtomicLong createdChunkCount = new AtomicLong();
   private AtomicLong reusedChunkCount = new AtomicLong();
 
